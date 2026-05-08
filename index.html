@@ -1,0 +1,1252 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>OpenSpeaks Metadata Generator – Local Test</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- React and ReactDOM from CDN -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Babel to compile JSX in-browser -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
+  <body style="margin:0;">
+    <div id="root"></div>
+
+    <!-- Your JSX app -->
+    <script type="text/babel">
+      // Paste the entire contents of openspeaks-metadata-generator.jsx here.
+      // Ensure the first line is:
+      // const { useState, useCallback, useMemo, useEffect } = React;
+      //
+      // Replace:
+      // import { useState, useCallback, useMemo, useEffect } from "react";
+      // with the line above.
+
+      // After pasting and adjusting the first line, at the very end add:
+
+      const { useState, useCallback, useMemo, useEffect } = React;
+
+const SCHEMA_VERSION = "1.2";
+const APP_VERSION = "0.1.0-alpha";
+
+// ============================================================
+// OpenSpeaks Metadata Generator is an open source tool published by OpenSpeaks and maintained by Subhashish Panigrahi. Published under the MIT License. Updated 7 May 2026.
+//
+// DATA MODEL
+// ============================================================
+const defaultOralHistory = {
+  enabled: true, dialectDetails: "", recordingContext: "field_recording",
+  recordingEquipment: "", interviewer: "", recorder: "",
+  consentType: "verbal", consentInformed: true, consentRevocable: false,
+  sensitiveContent: false, sensitiveContentNotes: "", consentRecordLocation: "",
+  communityReviewed: false, communityReviewDate: "", communityReviewNotes: "",
+  communityReviewers: "", transcriptAvailable: false, transcriptLanguages: "",
+  transcriptWriter: "", transcriptEditor: "", transcriptDate: "", transcriptLink: "",
+};
+
+const defaultRecord = {
+  _version: SCHEMA_VERSION, _exportedAt: "",
+  fileName: "", fileType: "video", duration: "", color: "Color", sound: "Stereo",
+  isOpenSpeaks: true, title: "", originalTitle: "", year: "", description: "",
+  projectName: "", cast: "", country: "India", language: "", languageISO: "",
+  dialect: "", recordingPlace: "", studio: "", producer: "", director: "",
+  writer: "", cinematographer: "", editor: "", recordist: "",
+  genre: "Interview", topic: "", releaseDate: "", doi: "", eidr: "", imdb: "",
+  subtitleLanguage: "", subtitlePageUrl: "", subtitleCreators: "",
+  subtitleEditorsReviewers: "", copyrightHolder: "", authorUsername: "",
+  framework_p1: true, framework_p2: false, framework_p3: false,
+  date: "", source: "{{own}}", license: "cc-by-sa-4.0", categories: "",
+  interviewees: [], oralHistory: { ...defaultOralHistory }, extra: {},
+};
+
+// ============================================================
+// WIKI PARSER MODULE
+// ============================================================
+function splitPipeRespectNesting(str) {
+  const parts = []; let depth = 0; let cur = "";
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i], n = str[i + 1];
+    if ((c === "{" && n === "{") || (c === "[" && n === "[")) { depth++; cur += c + n; i++; }
+    else if ((c === "}" && n === "}") || (c === "]" && n === "]")) { depth--; cur += c + n; i++; }
+    else if (c === "|" && depth === 0) { parts.push(cur); cur = ""; }
+    else cur += c;
+  }
+  if (cur) parts.push(cur);
+  return parts;
+}
+
+function extractTemplate(text, startIdx) {
+  let i = startIdx + 2; let depth = 1; let content = "";
+  while (i < text.length && depth > 0) {
+    if (text[i] === "{" && text[i + 1] === "{") { depth++; content += "{{"; i += 2; }
+    else if (text[i] === "}" && text[i + 1] === "}") { depth--; if (depth > 0) content += "}}"; i += 2; }
+    else { content += text[i++]; }
+  }
+  return { content, end: i };
+}
+
+function parseTemplateContent(content) {
+  const parts = splitPipeRespectNesting(content);
+  const name = parts[0].trim();
+  const params = {};
+  for (let j = 1; j < parts.length; j++) {
+    const eq = parts[j].indexOf("=");
+    if (eq > -1) params[parts[j].slice(0, eq).trim()] = parts[j].slice(eq + 1).trim();
+    else params[`_pos${j}`] = parts[j].trim();
+  }
+  return { name, params };
+}
+
+function findAllTemplates(text) {
+  const results = []; let i = 0;
+  while (i < text.length - 1) {
+    if (text[i] === "{" && text[i + 1] === "{") {
+      const { content, end } = extractTemplate(text, i);
+      results.push(parseTemplateContent(content));
+      i = end;
+    } else i++;
+  }
+  return results;
+}
+
+function parseWikitextIntoRecord(wikitext) {
+  const topTemplates = findAllTemplates(wikitext);
+  const infoTpl = topTemplates.find(t => /^information$/i.test(t.name.trim()));
+  if (!infoTpl) return null;
+
+  const p = infoTpl.params;
+  const result = {};
+  result.date = p["date"] || "";
+  result.source = p["source"] || "";
+
+  // Parse author field for username / copyright
+  const authorRaw = p["author"] || "";
+  const copyUserMatch = authorRaw.match(/Copyright[^:]*:\s*\[\[User:([^\]|]+)/i);
+  if (copyUserMatch) result.authorUsername = copyUserMatch[1].trim();
+  else {
+    const userMatch = authorRaw.match(/\[\[User:([^\]|]+)/i);
+    if (userMatch) result.authorUsername = userMatch[1].trim();
+  }
+  const creatorCopyMatch = authorRaw.match(/Copyright[^:]*:\s*\{\{Creator:([^|}]+)/i);
+  if (creatorCopyMatch) result.copyrightHolder = creatorCopyMatch[1].trim();
+
+  // Moral Rights interviewees from author
+  const moralMatch = authorRaw.match(/Moral Rights[^:]*:\s*(.+?)(?:;|$)/i);
+  if (moralMatch) {
+    const moralStr = moralMatch[1];
+    const wikidataParts = [...moralStr.matchAll(/\{\{Wikidata\|([^}]+)\}\}/gi)];
+    if (wikidataParts.length > 0) {
+      result.interviewees = wikidataParts.map(m => ({ fullName: "", wikidataQid: m[1].trim(), gender: "unknown", role: "Participant" }));
+    }
+  }
+
+  // Parse description for nested {{OpenSpeaks}}
+  const descRaw = p["description"] || "";
+  const descTemplates = findAllTemplates(descRaw);
+  const osTpl = descTemplates.find(t => /openspeaks/i.test(t.name));
+
+  if (osTpl) {
+    const op = osTpl.params;
+    result.description = op["description"] || op["_pos1"] || "";
+    result.projectName = op["Project_name"] || op["project_name"] || "";
+    result.cast = op["cast"] || op["Cast"] || "";
+    result.recordingPlace = op["Location"] || "";
+    result.language = op["Language"] || "";
+    result.duration = op["Runtime"] || "";
+    result.color = op["Color"] || "Color";
+    result.sound = op["Sound"] || "Stereo";
+    result.producer = op["Producer"] || "";
+    result.director = op["Director"] || "";
+    result.writer = op["Writer"] || "";
+    result.cinematographer = op["Cinematographer"] || "";
+    result.editor = op["Editor"] || "";
+    result.recordist = op["Recordist"] || "";
+    result.genre = op["Genre"] || "";
+    result.topic = op["Topic"] || "";
+    result.releaseDate = op["Release_Date"] || "";
+    result.doi = op["DOI"] || "";
+    result.imdb = op["IMDb"] || "";
+    result.framework_p1 = op["Framework_p1"] === "yes";
+    result.framework_p2 = op["Framework_p2"] === "yes";
+    result.framework_p3 = op["Framework_p3"] === "yes";
+    if (op["Copyright_holder"]) result.copyrightHolder = op["Copyright_holder"];
+
+    // Parse |Subtitles= line
+    const subLine = op["Subtitles"] || "";
+    const timedMatch = subLine.match(/\[\[TimedText:([^\]|]+)\|([^\]]+)\]\]/);
+    if (timedMatch) { result.subtitlePageUrl = timedMatch[1]; result.subtitleLanguage = timedMatch[2]; }
+    const byMatch = subLine.match(/\]\]\s+by\s+(.+)/s);
+    if (byMatch) {
+      const rest = byMatch[1];
+      const semiIdx = rest.indexOf(";");
+      if (semiIdx > -1) { result.subtitleCreators = rest.slice(0, semiIdx).trim(); result.subtitleEditorsReviewers = rest.slice(semiIdx + 1).trim(); }
+      else result.subtitleCreators = rest.trim();
+    }
+  }
+
+  // Categories
+  const catMatches = [...wikitext.matchAll(/\[\[Category:([^\]]+)\]\]/g)];
+  if (catMatches.length) result.categories = catMatches.map(m => m[1].trim()).join("\n");
+
+  // License
+  const selfMatch = wikitext.match(/\{\{self\|([^}]+)\}\}/);
+  if (selfMatch) result.license = selfMatch[1].trim();
+
+  // Oral history table fields
+  const ohResult = {};
+  const consentTypeMatch = wikitext.match(/\|\s*Consent type\s*\|\|\s*(\w+)/i);
+  if (consentTypeMatch) ohResult.consentType = consentTypeMatch[1].toLowerCase();
+  const reviewerMatch = wikitext.match(/\|\s*Reviewer\(s\)\s*\|\|\s*(.+)/i);
+  if (reviewerMatch) ohResult.communityReviewers = reviewerMatch[1].trim();
+  const reviewDateMatch = wikitext.match(/\|\s*Review date\s*\|\|\s*(.+)/i);
+  if (reviewDateMatch) ohResult.communityReviewDate = reviewDateMatch[1].trim();
+  const communityReviewedMatch = wikitext.match(/\|\s*Community reviewed\s*\|\|\s*(\w+)/i);
+  if (communityReviewedMatch) ohResult.communityReviewed = communityReviewedMatch[1].toLowerCase() === "yes";
+  if (Object.keys(ohResult).length) result.oralHistory = ohResult;
+
+  return result;
+}
+
+// ============================================================
+// OPEX / IMDI ADAPTER
+// ============================================================
+function parseOpexToRecord(xmlText) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlText, "application/xml");
+  const session = doc.querySelector("Session");
+  if (!session) return null;
+  const getText = (el, tag) => el?.querySelector(tag)?.textContent?.trim() || "";
+
+  const record = {};
+  record.title = getText(session, "Title");
+  record.releaseDate = getText(session, "Date");
+  record.date = record.releaseDate;
+  record.description = getText(session, "Description");
+
+  const loc = session.querySelector("Location");
+  if (loc) {
+    record.country = getText(loc, "Country");
+    const addr = getText(loc, "Address");
+    const region = getText(loc, "Region");
+    record.recordingPlace = addr || [region, record.country].filter(Boolean).join(", ");
+  }
+
+  const project = session.querySelector("Project");
+  if (project) {
+    record.projectName = getText(project, "Title");
+    record.extra = { projectId: getText(project, "Id") };
+  }
+
+  const genre = session.querySelector("Content > Genre");
+  if (genre) record.genre = genre.textContent.trim();
+
+  // Subject language (non-English first)
+  const langs = [...session.querySelectorAll("Content > Languages > Language")];
+  for (const lang of langs) {
+    const desc = getText(lang, "Description");
+    const id = getText(lang, "Id");
+    const iso = id.replace("ISO639-3:", "");
+    if (desc === "Subject Language" && iso !== "eng") {
+      const name = getText(lang, "Name");
+      record.language = `${name} (ISO 639: ${iso})`;
+      record.languageISO = iso;
+      break;
+    }
+  }
+
+  // Keywords → categories
+  const keywords = [...session.querySelectorAll('Key[Name="Keyword"]')];
+  if (keywords.length) record.categories = keywords.map(k => k.textContent.trim()).join("\n");
+
+  // Actors
+  const actors = [...session.querySelectorAll("Actor")];
+  const seen = new Set();
+  const interviewees = [];
+  const depositorEl = actors.find(a => getText(a, "Role") === "Depositor");
+
+  actors.forEach(actor => {
+    const role = getText(actor, "Role");
+    const fullName = getText(actor, "FullName") || getText(actor, "Name");
+    const sex = actor.querySelector("Sex")?.textContent?.trim()?.toLowerCase() || "unknown";
+    const wikidataKey = actor.querySelector('Key[Name="Wikidata"]');
+    const wikidataUrl = wikidataKey?.textContent?.trim() || "";
+    const wikidataQid = wikidataUrl.match(/Q\d+/)?.[0] || "";
+
+    if (["Research participant", "Participant", "Interviewee"].includes(role)) {
+      if (!seen.has(fullName)) {
+        seen.add(fullName);
+        interviewees.push({ fullName, wikidataQid, gender: sex === "female" ? "female" : sex === "male" ? "male" : "unknown", role });
+      }
+    }
+  });
+  record.interviewees = interviewees;
+
+  // Media files → fileName, fileType
+  const firstMedia = session.querySelector("MediaFile");
+  if (firstMedia) {
+    const link = getText(firstMedia, "ResourceLink");
+    const fmt = getText(firstMedia, "Format");
+    record.fileName = link.split("/").pop();
+    record.fileType = fmt.startsWith("video") ? "video" : fmt.startsWith("audio") ? "audio" : "other";
+  }
+
+  return record;
+}
+
+// ============================================================
+// BLAM / CMDI ADAPTER
+// ============================================================
+function parseBlamToRecord(raw) {
+  let data = raw;
+  if (typeof data === "string") { try { data = JSON.parse(data); } catch { return null; } }
+  const record = {};
+  const gi = data.CollectionGeneralInfo || {};
+  const pi = data.CollectionPublicationInfo || {};
+
+  record.title = gi.CollectionDisplayTitle || data.Header?.MdCollectionDisplayName || "";
+  record.description = gi.CollectionDescription || "";
+
+  const langs = gi.CollectionObjectLanguages?.CollectionObjectLanguage;
+  const lang = Array.isArray(langs) ? langs[0] : langs;
+  if (lang) {
+    const name = lang.ObjectLanguageDisplayName || lang.ObjectLanguageName || "";
+    const iso = lang["ObjectLanguageISO639-3Code"] || "";
+    record.language = iso ? `${name} (ISO 639: ${iso})` : name;
+    record.languageISO = iso;
+  }
+
+  const loc = gi.CollectionLocation || {};
+  record.country = loc.CollectionCountryFacet || "";
+  record.recordingPlace = [loc.CollectionLocationFacet, loc.CollectionRegionFacet, loc.CollectionCountryFacet].filter(Boolean).join(", ");
+
+  const kws = gi.CollectionKeywords?.CollectionKeyword;
+  record.categories = (Array.isArray(kws) ? kws : kws ? [kws] : []).join("\n");
+
+  const creators = pi.Creators?.Creator;
+  const creatorList = Array.isArray(creators) ? creators : creators ? [creators] : [];
+  record.interviewees = creatorList.map(c => ({
+    fullName: [c.CreatorGivenName, c.CreatorFamilyName].filter(Boolean).join(" "),
+    wikidataQid: "", gender: "unknown", role: "Creator",
+  }));
+
+  record.releaseDate = pi.PublicationYear ? String(pi.PublicationYear) : "";
+  record.projectName = data.Header?.MdCollectionDisplayName || "";
+  record.extra = { blam_id: data["@id"], blam_profile: data.Header?.MdProfile };
+
+  return record;
+}
+
+// ============================================================
+// OPENSPEAKS JSON IMPORT
+// ============================================================
+function importOpenSpeaksJSON(raw) {
+  let data = raw;
+  if (typeof data === "string") { try { data = JSON.parse(data); } catch { return null; } }
+  const oh = data.oralHistory || {};
+
+  const rawInterviewees = data.interviewees || [];
+  const seen = new Set();
+  const interviewees = rawInterviewees.map(ie => ({
+    fullName: [ie.firstName, ie.lastName].filter(Boolean).join(" ") || ie.fullName || "",
+    wikidataQid: ie.wikidataQid || "",
+    gender: ie.gender || "unknown",
+    role: ie.speakerRole || ie.role || "Participant",
+  })).filter(ie => { if (seen.has(ie.fullName)) return false; seen.add(ie.fullName); return true; });
+
+  const cats = Array.isArray(data.categories)
+    ? data.categories.join("\n")
+    : (data.categories || "");
+
+  const subLangs = data.subtitleLanguages || [];
+  const firstSub = subLangs[0] || {};
+
+  return {
+    ...defaultRecord,
+    _version: data._version || "1.2",
+    fileName: data.fileName || "",
+    fileType: data.fileType || "video",
+    duration: data.duration || "",
+    color: data.color || "Color",
+    sound: data.sound || "Stereo",
+    isOpenSpeaks: data.isOpenSpeaks !== false,
+    title: data.title || "",
+    originalTitle: data.originalTitle || "",
+    description: data.description || "",
+    projectName: data.projectName || "",
+    cast: data.cast || "",
+    country: data.locationCountry || data.country || "",
+    language: data.language
+      ? (data.languageISO ? `${data.language} (ISO 639: ${data.languageISO})` : data.language)
+      : "",
+    languageISO: data.languageISO || "",
+    dialect: data.dialect || "",
+    recordingPlace: data.recordingPlace || data.locationCity || data.locationProvince || "",
+    producer: data.producer || "",
+    director: data.director || "",
+    writer: data.writer || "",
+    cinematographer: data.cinematographer || "",
+    editor: data.editor || "",
+    recordist: data.recordist || "",
+    genre: data.genre || "",
+    topic: data.topic || "",
+    releaseDate: data.releaseDate || data.date || "",
+    doi: data.eidr || data.doi || "",
+    imdb: data.imdb || "",
+    subtitleLanguage: data.subtitleLanguage || firstSub.language || "",
+    subtitlePageUrl: data.subtitlePageUrl || firstSub.subtitleLink || "",
+    subtitleCreators: data.subtitleCreators || "",
+    subtitleEditorsReviewers: data.subtitleEditorsReviewers || "",
+    copyrightHolder: data.copyrightHolder || "",
+    authorUsername: data.authorUsername || data.author || "",
+    framework_p1: oh.enabled !== false,
+    framework_p2: oh.communityReviewed || false,
+    framework_p3: !!(data.hasClosedCaptions || oh.transcriptAvailable),
+    date: data.date || data.releaseDate || "",
+    source: data.source || "{{own}}",
+    license: data.license || "cc-by-sa-4.0",
+    categories: cats,
+    interviewees,
+    oralHistory: { ...defaultOralHistory, ...oh },
+    extra: data.extra || {},
+  };
+}
+
+// ============================================================
+// AUTHOR FORMATTER
+// ============================================================
+function formatAuthorField(record) {
+  const { interviewees = [], authorUsername, copyrightHolder } = record;
+
+  let moralRights = "";
+  if (interviewees.length > 0) {
+    moralRights = interviewees
+      .map(ie => ie.wikidataQid ? `{{Wikidata|${ie.wikidataQid}}}` : ie.fullName)
+      .filter(Boolean).join(", ");
+  } else if (authorUsername) {
+    moralRights = `[[User:${authorUsername}]]`;
+  } else if (copyrightHolder) {
+    moralRights = copyrightHolder;
+  }
+
+  const copyright = authorUsername ? `[[User:${authorUsername}]]` : (copyrightHolder || "");
+
+  const lines = [];
+  if (moralRights) lines.push(`; Moral Rights: ${moralRights}`);
+  if (copyright) lines.push(`; Copyright: ${copyright}`);
+  return lines.join("\n");
+}
+
+// ============================================================
+// SUBTITLE FORMATTER
+// ============================================================
+function formatSubtitles(record) {
+  const { subtitleLanguage, subtitlePageUrl, subtitleCreators, subtitleEditorsReviewers } = record;
+  if (!subtitlePageUrl && !subtitleCreators) return "";
+
+  let pageName = subtitlePageUrl || "";
+  if (pageName.startsWith("http")) {
+    try { pageName = decodeURIComponent(pageName.split("/").pop()); } catch { pageName = pageName.split("/").pop(); }
+  }
+  if (pageName && !pageName.startsWith("TimedText:")) pageName = `TimedText:${pageName}`;
+
+  const timedLink = pageName ? `[[${pageName}|${subtitleLanguage || "Language"}]]` : `[[TimedText:|${subtitleLanguage || "Language"}]]`;
+
+  const creatorList = (subtitleCreators || "").split(",").map(n => n.trim()).filter(Boolean).join(", ");
+
+  let editorReviewerList = "";
+  const er = (subtitleEditorsReviewers || "").trim();
+  if (er) {
+    if (er.includes("/")) {
+      const [editorSeg, reviewerSeg] = er.split("/");
+      const editors = editorSeg.split(",").map(n => n.trim()).filter(Boolean).map(n => `${n} (editor)`);
+      const reviewers = reviewerSeg.split(",").map(n => n.trim()).filter(Boolean).map(n => `${n} (reviewer)`);
+      const parts = [];
+      if (editors.length) parts.push(editors.join(", "));
+      if (reviewers.length) parts.push(reviewers.join(", "));
+      editorReviewerList = parts.join("; ");
+    } else {
+      const names = er.split(",").map(n => n.trim()).filter(Boolean);
+      if (names.length === 1) editorReviewerList = `${names[0]} (editor)`;
+      else if (names.length === 2) editorReviewerList = `${names[0]} (editor), ${names[1]} (reviewer)`;
+      else editorReviewerList = names.map(n => `${n} (editor)`).join(", ");
+    }
+  }
+
+  let result = timedLink ? `In ${timedLink} by ${creatorList}` : creatorList;
+  if (editorReviewerList) result += `; ${editorReviewerList}`;
+  return result;
+}
+
+// ============================================================
+// EXPORTERS
+// ============================================================
+function exportToWikicode(record) {
+  const authorField = formatAuthorField(record);
+  const subtitlesField = formatSubtitles(record);
+
+  const osParams = [
+    `|description=${record.description}`,
+    `|Project_name=${record.projectName}`,
+    record.cast ? `|cast=${record.cast}` : null,
+    `|Location=${record.recordingPlace}`,
+    `|Language=${record.language}`,
+    record.duration ? `|Runtime=${record.duration}` : null,
+    `|Color=${record.color}`,
+    `|Sound=${record.sound}`,
+    record.producer ? `|Producer=${record.producer}` : null,
+    record.director ? `|Director=${record.director}` : null,
+    record.writer ? `|Writer=${record.writer}` : null,
+    record.cinematographer ? `|Cinematographer=${record.cinematographer}` : null,
+    record.editor ? `|Editor=${record.editor}` : null,
+    record.recordist ? `|Recordist=${record.recordist}` : null,
+    `|Genre=${record.genre}`,
+    record.topic ? `|Topic=${record.topic}` : null,
+    record.releaseDate ? `|Release_Date=${record.releaseDate}` : null,
+    record.doi ? `|DOI=${record.doi}` : null,
+    record.imdb ? `|IMDb=${record.imdb}` : null,
+    subtitlesField ? `|Subtitles=${subtitlesField}` : null,
+    `|Framework_p1=${record.framework_p1 ? "yes" : "no"}`,
+    `|Framework_p2=${record.framework_p2 ? "yes" : "no"}`,
+    `|Framework_p3=${record.framework_p3 ? "yes" : "no"}`,
+  ].filter(Boolean);
+
+  const osBlock = `{{OpenSpeaks\n${osParams.join("\n")}\n}}`;
+  const infoBlock = `=={{int:filedesc}}==\n{{Information\n|description=\n${osBlock}\n|date=${record.date}\n|source=${record.source}\n|author=\n${authorField}\n|permission={{Personality rights}}\n|other_versions=\n|other_fields=\n}}\n\n{{Closed captions}}`;
+
+  const oh = record.oralHistory;
+  const speakerList = record.interviewees.map(ie =>
+    ie.wikidataQid ? `[[d:${ie.wikidataQid}|${ie.fullName}]] (${ie.gender})` : `${ie.fullName} (${ie.gender})`
+  ).join(", ") || "";
+
+  const p1Table = `{| class="wikitable"\n|-\n! Field !! Value\n|-\n| Language || ${record.language}\n|-\n| Dialect || ${oh.dialectDetails || record.recordingPlace}\n|-\n| Topic || ${record.topic}\n|-\n| Recording location || ${record.recordingPlace}\n|-\n| Recording date || ${record.date}\n|-\n| Recording context || ${oh.recordingContext}\n|-\n| Recording equipment || ${oh.recordingEquipment}\n|-\n| Project name || ${record.projectName}\n|-\n| Speaker(s) || ${speakerList}\n|-\n| Interviewer || ${oh.interviewer}\n|-\n| Recorder / Camera operator || ${oh.recorder}\n|-\n| Consent type || ${oh.consentType}\n|-\n| Consent informed || ${oh.consentInformed ? "Yes" : "No"}\n|-\n| Consent revocable || ${oh.consentRevocable ? "Yes" : "No"}\n|-\n| Sensitive content || ${oh.sensitiveContent ? "Yes" : "No"}\n|-\n| Consent record location || ${oh.consentRecordLocation}\n|}`;
+
+  const p2Table = `{| class="wikitable"\n|-\n! Field !! Value\n|-\n| Community reviewed || ${oh.communityReviewed ? "Yes" : "No"}\n|-\n| Review date || ${oh.communityReviewDate}\n|-\n| Reviewer(s) || ${oh.communityReviewers}\n|-\n| Review notes || ${oh.communityReviewNotes}\n|}`;
+
+  const transcriptDetails = [
+    oh.transcriptWriter ? `by ${oh.transcriptWriter}` : "",
+    oh.transcriptEditor ? `edited by ${oh.transcriptEditor}` : "",
+    oh.transcriptDate ? `published ${oh.transcriptDate}` : "",
+    oh.transcriptLink ? `(${oh.transcriptLink})` : "",
+  ].filter(Boolean).join(", ");
+
+  const p3Table = `{| class="wikitable"\n|-\n! Field !! Value\n|-\n| Subtitles available || ${record.subtitlePageUrl ? "Yes" : "No"}\n|-\n| Subtitle details || ${subtitlesField}\n|-\n| Transcript available || ${oh.transcriptAvailable ? "Yes" : "No"}\n|-\n| Transcript details || ${transcriptDetails}\n|-\n| Transcript language(s) || ${oh.transcriptLanguages}\n|}`;
+
+  const ohSection = `== OpenSpeaks Oral History Documentation Record ==\n\n=== Parameter 1: Provenance and consent (${record.framework_p1 ? "yes" : "no"}) ===\n\n${p1Table}\n\n=== Parameter 2: Community review (${record.framework_p2 ? "yes" : "no"}) ===\n\n${p2Table}\n\n=== Parameter 3: Multilingual transcription / subtitles (${record.framework_p3 ? "yes" : "no"}) ===\n\n${p3Table}`;
+
+  const licenseSection = `=={{int:license-header}}==\n{{self|${record.license}}}`;
+  const catLines = (record.categories || "").split(/[\n,]/).map(c => c.trim()).filter(Boolean).map(c => `[[Category:${c}]]`).join("\n");
+
+  return [infoBlock, "", ohSection, "", licenseSection, "", catLines].join("\n");
+}
+
+function exportToJSON(record) {
+  return JSON.stringify({ ...record, _version: SCHEMA_VERSION, _exportedAt: new Date().toISOString() }, null, 2);
+}
+
+function exportToMarkdown(record) {
+  const authorField = formatAuthorField(record);
+  const subtitlesField = formatSubtitles(record);
+  const ieList = record.interviewees.map(ie =>
+    `- **${ie.fullName || "(unnamed)"}**${ie.wikidataQid ? ` ([${ie.wikidataQid}](https://www.wikidata.org/wiki/${ie.wikidataQid}))` : ""} — ${ie.gender}, ${ie.role}`
+  ).join("\n") || "_None_";
+
+  return `# ${record.title || "OpenSpeaks Record"}
+
+## Basic Information
+| Field | Value |
+|-------|-------|
+| File | \`${record.fileName}\` |
+| Type | ${record.fileType} |
+| Language | ${record.language} |
+| Location | ${record.recordingPlace} |
+| Country | ${record.country} |
+| Date | ${record.date} |
+| Release Date | ${record.releaseDate} |
+| Duration | ${record.duration} |
+| Project | ${record.projectName} |
+
+## Description
+
+${record.description || "_No description_"}
+
+## Production Crew
+
+| Role | Name |
+|------|------|
+| Cast | ${record.cast} |
+| Producer | ${record.producer} |
+| Director | ${record.director} |
+| Writer | ${record.writer} |
+| Cinematographer | ${record.cinematographer} |
+| Editor | ${record.editor} |
+| Recordist | ${record.recordist} |
+| Genre | ${record.genre} |
+| Topic | ${record.topic} |
+
+## Identifiers
+
+| Field | Value |
+|-------|-------|
+| DOI / EIDR | ${record.doi} |
+| IMDb | ${record.imdb} |
+| License | ${record.license} |
+
+## Attribution
+
+\`\`\`
+${authorField}
+\`\`\`
+
+## Interviewees / Participants
+
+${ieList}
+
+## Subtitles
+
+${subtitlesField || "_None_"}
+
+## OpenSpeaks Framework
+
+| Parameter | Status |
+|-----------|--------|
+| P1: Provenance & Consent | ${record.framework_p1 ? "✓ Yes" : "✗ No"} |
+| P2: Community Review | ${record.framework_p2 ? "✓ Yes" : "✗ No"} |
+| P3: Multilingual Transcription | ${record.framework_p3 ? "✓ Yes" : "✗ No"} |
+
+## Categories
+
+${(record.categories || "").split("\n").filter(Boolean).map(c => `- ${c}`).join("\n") || "_None_"}
+`;
+}
+
+function exportToHTML(record) {
+  const authorField = formatAuthorField(record).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const subtitlesField = formatSubtitles(record).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const ieRows = record.interviewees.map(ie =>
+    `<tr><td>${ie.fullName}</td><td>${ie.wikidataQid ? `<a href="https://www.wikidata.org/wiki/${ie.wikidataQid}">${ie.wikidataQid}</a>` : ""}</td><td>${ie.gender}</td><td>${ie.role}</td></tr>`
+  ).join("");
+  const catItems = (record.categories || "").split("\n").filter(Boolean).map(c => `<li>${c}</li>`).join("");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>${record.title || "OpenSpeaks Record"}</title>
+<style>
+  body { font-family: Georgia, serif; max-width: 860px; margin: 2rem auto; padding: 0 1.5rem; color: #1c1410; background: #fdf8f3; }
+  h1 { color: #7c2d12; border-bottom: 2px solid #7c2d12; padding-bottom: .5rem; font-size: 1.8rem; }
+  h2 { color: #9a3920; font-size: 1.2rem; margin-top: 2rem; }
+  table { border-collapse: collapse; width: 100%; margin: .75rem 0; }
+  th { background: #f5ede0; text-align: left; padding: .5rem .75rem; font-size: .85rem; }
+  td { padding: .45rem .75rem; border-bottom: 1px solid #e8ddd0; font-size: .875rem; }
+  pre { background: #1c1410; color: #e8ddd0; padding: 1rem; border-radius: 6px; font-size: .75rem; white-space: pre-wrap; }
+  .desc { background: #faf5ef; padding: 1rem; border-left: 4px solid #c4873a; font-style: italic; font-size: .9rem; }
+  .badge { display: inline-block; padding: .2rem .6rem; border-radius: 999px; font-size: .75rem; font-weight: bold; margin-right: .25rem; }
+  .badge-yes { background: #dcfce7; color: #166534; }
+  .badge-no { background: #fee2e2; color: #991b1b; }
+</style>
+</head>
+<body>
+<h1>${record.title || "OpenSpeaks Record"}</h1>
+<h2>Basic Information</h2>
+<table>
+  <tr><th>File</th><td><code>${record.fileName}</code></td></tr>
+  <tr><th>Type</th><td>${record.fileType}</td></tr>
+  <tr><th>Language</th><td>${record.language}</td></tr>
+  <tr><th>Location</th><td>${record.recordingPlace}</td></tr>
+  <tr><th>Date</th><td>${record.date}</td></tr>
+  <tr><th>Release Date</th><td>${record.releaseDate}</td></tr>
+  <tr><th>Project</th><td>${record.projectName}</td></tr>
+  <tr><th>License</th><td>${record.license}</td></tr>
+</table>
+<h2>Description</h2>
+<div class="desc">${record.description || "<em>No description</em>"}</div>
+<h2>Production Crew</h2>
+<table>
+  <tr><th>Cast</th><td>${record.cast}</td></tr>
+  <tr><th>Producer</th><td>${record.producer}</td></tr>
+  <tr><th>Director</th><td>${record.director}</td></tr>
+  <tr><th>Writer</th><td>${record.writer}</td></tr>
+  <tr><th>Cinematographer</th><td>${record.cinematographer}</td></tr>
+  <tr><th>Editor</th><td>${record.editor}</td></tr>
+  <tr><th>Recordist</th><td>${record.recordist}</td></tr>
+  <tr><th>Genre</th><td>${record.genre}</td></tr>
+  <tr><th>Topic</th><td>${record.topic}</td></tr>
+</table>
+<h2>Author Field</h2>
+<pre>${authorField}</pre>
+<h2>Interviewees</h2>
+<table>
+  <tr><th>Name</th><th>Wikidata QID</th><th>Gender</th><th>Role</th></tr>
+  ${ieRows || "<tr><td colspan='4'><em>None</em></td></tr>"}
+</table>
+<h2>Subtitles</h2>
+<p>${subtitlesField || "<em>None</em>"}</p>
+<h2>OpenSpeaks Framework</h2>
+<p>
+  <span class="badge ${record.framework_p1 ? "badge-yes" : "badge-no"}">P1: Provenance &amp; Consent ${record.framework_p1 ? "✓" : "✗"}</span>
+  <span class="badge ${record.framework_p2 ? "badge-yes" : "badge-no"}">P2: Community Review ${record.framework_p2 ? "✓" : "✗"}</span>
+  <span class="badge ${record.framework_p3 ? "badge-yes" : "badge-no"}">P3: Multilingual Transcription ${record.framework_p3 ? "✓" : "✗"}</span>
+</p>
+<h2>Categories</h2>
+<ul>${catItems || "<li><em>None</em></li>"}</ul>
+</body>
+</html>`;
+}
+
+// ============================================================
+// COMPONENT HELPERS
+// ============================================================
+const inputStyle = {
+  width: "100%", padding: "0.5rem 0.65rem", borderRadius: "6px",
+  border: "1.5px solid var(--border)", background: "var(--surface)",
+  color: "var(--text)", fontSize: "0.85rem", fontFamily: "inherit",
+};
+
+function Field({ label, help, children }) {
+  return (
+    <div style={{ marginBottom: "1.25rem" }}>
+      <label style={{ display: "block", fontSize: "0.7rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--label)", marginBottom: "0.3rem" }}>{label}</label>
+      {help && <div style={{ fontSize: "0.68rem", color: "var(--muted)", marginBottom: "0.3rem", lineHeight: 1.4 }}>{help}</div>}
+      {children}
+    </div>
+  );
+}
+
+function FInput({ value, onChange, placeholder, type = "text" }) {
+  return <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} style={inputStyle} />;
+}
+
+function FTextarea({ value, onChange, placeholder, rows = 4 }) {
+  return <textarea value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} rows={rows} style={{ ...inputStyle, resize: "vertical", fontFamily: "inherit", lineHeight: 1.5 }} />;
+}
+
+function FSelect({ value, onChange, options }) {
+  return <select value={value} onChange={e => onChange(e.target.value)} style={inputStyle}>{options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}</select>;
+}
+
+function FCheckbox({ label: lbl, checked, onChange }) {
+  return (
+    <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer", fontSize: "0.85rem", color: "var(--text)" }}>
+      <input type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)} style={{ width: "1rem", height: "1rem", accentColor: "var(--accent)" }} />
+      {lbl}
+    </label>
+  );
+}
+
+function SectionTitle({ title, sub }) {
+  return (
+    <>
+      <h2 style={{ fontFamily: "var(--font-display)", fontSize: "1.6rem", fontWeight: 600, color: "var(--accent)", margin: "0 0 0.2rem 0", lineHeight: 1.2 }}>{title}</h2>
+      {sub && <p style={{ fontSize: "0.78rem", color: "var(--muted)", margin: "0 0 2rem 0" }}>{sub}</p>}
+    </>
+  );
+}
+
+function PreviewBox({ label, content }) {
+  return (
+    <div style={{ background: "var(--accent-light)", border: "1px solid rgba(124,45,18,.2)", borderRadius: "8px", padding: "1rem 1.25rem", marginBottom: "1.75rem" }}>
+      <div style={{ fontSize: "0.68rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--accent)", marginBottom: "0.5rem" }}>{label}</div>
+      <pre style={{ fontFamily: "var(--font-mono)", fontSize: "0.72rem", color: "var(--text)", margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{content || "(fill in the fields below)"}</pre>
+    </div>
+  );
+}
+
+// ============================================================
+// MAIN APP
+// ============================================================
+function App() {
+  const [record, setRecord] = useState(defaultRecord);
+  const [activeTab, setActiveTab] = useState("basic");
+  const [pasteInput, setPasteInput] = useState("");
+  const [parseMsg, setParseMsg] = useState({ type: "", text: "" });
+  const [exportFmt, setExportFmt] = useState("wikicode");
+  const [copied, setCopied] = useState(false);
+  const [clearMsg, setClearMsg] = useState("");
+
+  const updateField = useCallback((field, value) => setRecord(r => ({ ...r, [field]: value })), []);
+  const updateOH = useCallback((field, value) => setRecord(r => ({ ...r, oralHistory: { ...r.oralHistory, [field]: value } })), []);
+
+  const addInterviewee = () => setRecord(r => ({ ...r, interviewees: [...r.interviewees, { fullName: "", wikidataQid: "", gender: "unknown", role: "Participant" }] }));
+  const updateIE = (idx, field, value) => setRecord(r => { const ie = [...r.interviewees]; ie[idx] = { ...ie[idx], [field]: value }; return { ...r, interviewees: ie }; });
+  const removeIE = (idx) => setRecord(r => ({ ...r, interviewees: r.interviewees.filter((_, i) => i !== idx) }));
+
+  const applyParsed = (parsed, source) => {
+    if (!parsed) { setParseMsg({ type: "error", text: `Could not parse the ${source}.` }); return; }
+    setRecord(r => ({ ...r, ...parsed, oralHistory: { ...r.oralHistory, ...(parsed.oralHistory || {}) } }));
+    setParseMsg({ type: "success", text: `✓ Form populated from ${source}!` });
+    if (activeTab === "import") setTimeout(() => setActiveTab("basic"), 1200);
+  };
+
+  const handleParseWikitext = () => {
+    setParseMsg({});
+    const parsed = parseWikitextIntoRecord(pasteInput);
+    applyParsed(parsed, "pasted wikitext");
+  };
+
+  const handleFileImport = (e, adapter, label) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => applyParsed(adapter(ev.target.result), label);
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const generatedOutput = useMemo(() => {
+    const fns = { wikicode: exportToWikicode, json: exportToJSON, markdown: exportToMarkdown, html: exportToHTML };
+    return (fns[exportFmt] || exportToWikicode)(record);
+  }, [record, exportFmt]);
+
+  const copyOutput = () => {
+    navigator.clipboard.writeText(generatedOutput).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000); });
+  };
+
+  const downloadOutput = () => {
+    const exts = { wikicode: "txt", json: "json", markdown: "md", html: "html" };
+    const mimes = { wikicode: "text/plain", json: "application/json", markdown: "text/markdown", html: "text/html" };
+    const blob = new Blob([generatedOutput], { type: mimes[exportFmt] });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${record.fileName.replace(/\.[^.]+$/, "") || "openspeaks"}.${exts[exportFmt]}`;
+    a.click();
+  };
+
+  const resetForm = () => { setRecord(defaultRecord); setClearMsg("Form cleared."); setTimeout(() => setClearMsg(""), 2500); };
+
+  const TABS = [
+    { id: "basic", icon: "📄", label: "Basic Info" },
+    { id: "production", icon: "🎬", label: "Production" },
+    { id: "people", icon: "👥", label: "People" },
+    { id: "subtitles", icon: "📝", label: "Subtitles & OH" },
+    { id: "license", icon: "🏷️", label: "License" },
+    { id: "import", icon: "📥", label: "Import" },
+    { id: "export", icon: "📤", label: "Preview & Export" },
+  ];
+
+  const G2 = { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1.25rem" };
+  const G3 = { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "1.25rem" };
+
+  return (
+    <div style={{ minHeight: "100vh", background: "var(--bg)", color: "var(--text)", fontFamily: "var(--font-body)" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500&family=Outfit:wght@300;400;500;600;700&display=swap');
+        :root {
+          --bg:#fdf8f2; --surface:#ffffff; --surface2:#f8f1e8; --surface3:#f2e8da;
+          --border:#e5d8c8; --accent:#7c2d12; --accent2:#b45309; --accent-light:#fef3c7;
+          --text:#1a120b; --text2:#5c4030; --muted:#9a7060; --label:#7c5540;
+          --success:#14532d; --error:#7f1d1d;
+          --font-display:'Lora',Georgia,serif;
+          --font-body:'Outfit',system-ui,sans-serif;
+          --font-mono:'JetBrains Mono',monospace;
+        }
+        *{box-sizing:border-box;}
+        input,textarea,select{transition:border-color .15s,box-shadow .15s;}
+        input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent)!important;box-shadow:0 0 0 3px rgba(124,45,18,.12);}
+        .tab-btn{border:none;background:transparent;padding:.55rem .9rem;border-radius:6px 6px 0 0;cursor:pointer;font-family:var(--font-body);font-size:.78rem;font-weight:500;color:var(--muted);transition:all .15s;white-space:nowrap;display:flex;align-items:center;gap:.35rem;}
+        .tab-btn:hover{color:var(--accent);background:var(--accent-light);}
+        .tab-btn.active{color:var(--accent);background:var(--surface);font-weight:600;border-bottom:2.5px solid var(--accent);}
+        .btn-primary{background:var(--accent);color:#fff;border:none;padding:.55rem 1.2rem;border-radius:6px;font-family:var(--font-body);font-size:.8rem;font-weight:600;cursor:pointer;transition:all .15s;letter-spacing:.02em;}
+        .btn-primary:hover{background:#991b1b;transform:translateY(-1px);box-shadow:0 3px 10px rgba(124,45,18,.3);}
+        .btn-sec{background:var(--surface2);color:var(--text2);border:1.5px solid var(--border);padding:.5rem .95rem;border-radius:6px;font-family:var(--font-body);font-size:.78rem;font-weight:500;cursor:pointer;transition:all .15s;}
+        .btn-sec:hover{background:var(--surface3);color:var(--text);}
+        .import-zone{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.5rem;background:var(--surface);border:2px dashed var(--border);padding:1.5rem 1rem;border-radius:10px;font-family:var(--font-body);font-size:.82rem;font-weight:500;color:var(--muted);cursor:pointer;transition:all .2s;text-align:center;width:100%;}
+        .import-zone:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-light);}
+        .efmt-btn{padding:.4rem .85rem;border-radius:5px;border:1.5px solid var(--border);font-size:.75rem;font-family:var(--font-body);font-weight:500;cursor:pointer;background:var(--surface2);color:var(--text2);transition:all .15s;}
+        .efmt-btn.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+        ::-webkit-scrollbar{width:5px;height:5px;}
+        ::-webkit-scrollbar-track{background:var(--surface2);}
+        ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}
+        code{font-family:var(--font-mono);font-size:.8em;background:var(--surface3);padding:.1em .4em;border-radius:3px;}
+      `}</style>
+
+      {/* ── Header ── */}
+      <header style={{ background: "linear-gradient(135deg, #7c2d12 0%, #9a3d20 60%, #b45309 100%)", padding: "1rem 2rem", display: "flex", alignItems: "center", justifyContent: "space-between", boxShadow: "0 2px 16px rgba(0,0,0,.25)" }}>
+        <div>
+          <div style={{ fontFamily: "var(--font-display)", fontSize: "1.5rem", fontWeight: 700, color: "#fff", letterSpacing: "-0.01em", lineHeight: 1.2 }}>OpenSpeaks Metadata Generator</div>
+          <div style={{ fontSize: "0.68rem", color: "rgba(255,255,255,.65)", letterSpacing: "0.1em", textTransform: "uppercase", marginTop: "3px" }}>Create metadata for oral knowledge</div>
+        </div>
+        <div style={{ display: "flex", gap: "0.5rem", flexShrink: 0 }}>
+          {[`Schema ${SCHEMA_VERSION}`, "OPEX/IMDI", "BLAM/CMDI"].map(tag => (
+            <span key={tag} style={{ background: "rgba(255,255,255,.15)", color: "rgba(255,255,255,.9)", border: "1px solid rgba(255,255,255,.3)", borderRadius: "999px", padding: "0.2rem 0.65rem", fontSize: "0.65rem", fontWeight: 600, letterSpacing: "0.05em" }}>{tag}</span>
+          ))}
+        </div>
+      </header>
+
+      {/* ── Tab Bar ── */}
+      <div style={{ background: "var(--surface2)", borderBottom: "1.5px solid var(--border)", padding: "0 1.5rem", overflowX: "auto", display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+        <div style={{ display: "flex", gap: "2px", minWidth: "max-content" }}>
+          {TABS.map(t => (
+            <button key={t.id} className={`tab-btn ${activeTab === t.id ? "active" : ""}`} onClick={() => setActiveTab(t.id)}>
+              <span>{t.icon}</span> {t.label}
+            </button>
+          ))}
+        </div>
+        <button className="btn-sec" onClick={resetForm} style={{ marginBottom: "4px", fontSize: ".72rem", padding: ".35rem .7rem" }}>↺ Reset</button>
+      </div>
+
+      {clearMsg && <div style={{ background: "#f0fdf4", padding: ".5rem 1.5rem", fontSize: ".78rem", color: "var(--success)", borderBottom: "1px solid #bbf7d0" }}>{clearMsg}</div>}
+
+      {/* ── Main ── */}
+      <main style={{ maxWidth: "920px", margin: "0 auto", padding: "2rem 1.5rem" }}>
+
+        {/* ─── BASIC INFO ─── */}
+        {activeTab === "basic" && (
+          <div>
+            <SectionTitle title="Basic Information" sub="Core metadata for the recording" />
+            <div style={G2}>
+              <Field label="File Name"><FInput value={record.fileName} onChange={v => updateField("fileName", v)} placeholder="juray001.mp4" /></Field>
+              <Field label="File Type">
+                <FSelect value={record.fileType} onChange={v => updateField("fileType", v)}
+                  options={[{value:"video",label:"Video"},{value:"audio",label:"Audio"},{value:"image",label:"Image"},{value:"document",label:"Document"}]} />
+              </Field>
+            </div>
+            <Field label="Title" help="Supports multilingual titles: 'Juray language documentation / जुराय भाषा दस्तावेज़ीकरण'">
+              <FInput value={record.title} onChange={v => updateField("title", v)} placeholder="Juray language documentation / जुराय भाषा दस्तावेज़ीकरण" />
+            </Field>
+            <Field label="Title in native/other language"><FInput value={record.originalTitle} onChange={v => updateField("originalTitle", v)} placeholder="Title in native script (optional)" /></Field>
+            <Field label="File description" help="">
+              <FTextarea value={record.description} onChange={v => updateField("description", v)} rows={5} placeholder="Describe the session, its context, and why it matters for language documentation..." />
+            </Field>
+            <div style={G2}>
+              <Field label="Language" help="For dialects, in Dialect-Language format">
+                <FInput value={record.language} onChange={v => updateField("language", v)} placeholder="Marchha-Rongpo" />
+              </Field>
+              <Field label="Language ISO 639-3"><FInput value={record.languageISO} onChange={v => updateField("languageISO", v)} placeholder="juy" /></Field>
+            </div>
+            <div style={G2}>
+              <Field label="Country"><FInput value={record.country} onChange={v => updateField("country", v)} placeholder="India" /></Field>
+              <Field label="Recording Location"><FInput value={record.recordingPlace} onChange={v => updateField("recordingPlace", v)} placeholder="Village/City, Province/State" /></Field>
+            </div>
+            <div style={G3}>
+              <Field label="Recording Date" help="YYYY-MM-DD"><FInput value={record.releaseDate} onChange={v => updateField("releaseDate", v)} placeholder="2026-04-16" /></Field>
+              <Field label="Publication Date" help="YYYY-MM-DD"><FInput value={record.date} onChange={v => updateField("date", v)} placeholder="2026-04-07" /></Field>
+              <Field label="Duration / Runtime"><FInput value={record.duration} onChange={v => updateField("duration", v)} placeholder="2:25 min" /></Field>
+            </div>
+            <div style={G3}>
+              <Field label="Color">
+                <FSelect value={record.color} onChange={v => updateField("color", v)} options={[{value:"Color",label:"Color"},{value:"Black and white",label:"Black & White"},{value:"Mixed",label:"Mixed"}]} />
+              </Field>
+              <Field label="Sound">
+                <FSelect value={record.sound} onChange={v => updateField("sound", v)} options={[{value:"Stereo",label:"Stereo"},{value:"Mono",label:"Mono"},{value:"Silent",label:"Silent"}]} />
+              </Field>
+              <Field label="File source"><FInput value={record.source} onChange={v => updateField("source", v)} placeholder="{{own}}" /></Field>
+            </div>
+          </div>
+        )}
+
+        {/* ─── PRODUCTION ─── */}
+        {activeTab === "production" && (
+          <div>
+            <SectionTitle title="Production Details" sub="Crew, identifiers, and classification metadata" />
+            <Field label="Project Name"><FInput value={record.projectName} onChange={v => updateField("projectName", v)} placeholder="OpenSpeaks Archives" /></Field>
+            <div style={G2}>
+              <Field label="Cast / Featured Speaker(s)"><FInput value={record.cast} onChange={v => updateField("cast", v)} placeholder="Dinabandhu Gamango" /></Field>
+              <Field label="Genre"><FInput value={record.genre} onChange={v => updateField("genre", v)} placeholder="Interview" /></Field>
+            </div>
+            <Field label="Topic"><FInput value={record.topic} onChange={v => updateField("topic", v)} placeholder="Language documentation" /></Field>
+            <div style={G2}>
+              <Field label="Producer"><FInput value={record.producer} onChange={v => updateField("producer", v)} /></Field>
+              <Field label="Director"><FInput value={record.director} onChange={v => updateField("director", v)} /></Field>
+            </div>
+            <div style={G2}>
+              <Field label="Writer"><FInput value={record.writer} onChange={v => updateField("writer", v)} /></Field>
+              <Field label="Cinematographer"><FInput value={record.cinematographer} onChange={v => updateField("cinematographer", v)} /></Field>
+            </div>
+            <div style={G2}>
+              <Field label="Editor"><FInput value={record.editor} onChange={v => updateField("editor", v)} /></Field>
+              <Field label="Recordist / Camera Operator"><FInput value={record.recordist} onChange={v => updateField("recordist", v)} /></Field>
+            </div>
+            <div style={{ borderTop: "1px solid var(--border)", paddingTop: "1.5rem", marginTop: "0.5rem" }}>
+              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.1rem", color: "var(--text2)", marginBottom: "1rem", fontStyle: "italic" }}>Identifiers</div>
+              <div style={G3}>
+                <Field label="DOI / EIDR"><FInput value={record.doi} onChange={v => updateField("doi", v)} placeholder="10.5240/XXXX" /></Field>
+                <Field label="IMDb"><FInput value={record.imdb} onChange={v => updateField("imdb", v)} placeholder="tt14546228" /></Field>
+                <Field label="ISRC"><FInput value={record.isrc || ""} onChange={v => updateField("isrc", v)} /></Field>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ─── PEOPLE ─── */}
+        {activeTab === "people" && (
+          <div>
+            <SectionTitle title="People & Attribution" sub="Author, copyright holder, and participant data" />
+            <PreviewBox label="Live preview — generated |author= field" content={formatAuthorField(record)} />
+            <div style={G2}>
+              <Field label="Author Username (Commons)" help="No 'User:' prefix. Goes into the Copyright line of |author=.">
+                <FInput value={record.authorUsername} onChange={v => updateField("authorUsername", v)} placeholder="SubhashishPanigrahi" />
+              </Field>
+              <Field label="Copyright Holder" help="Fallback if no username. No longer emitted as |Copyright_holder= in {{OpenSpeaks}}.">
+                <FInput value={record.copyrightHolder} onChange={v => updateField("copyrightHolder", v)} placeholder="Subhashish Panigrahi" />
+              </Field>
+            </div>
+
+            <div style={{ borderTop: "1px solid var(--border)", paddingTop: "1.5rem", marginTop: "0.5rem" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
+                <div>
+                  <div style={{ fontFamily: "var(--font-display)", fontSize: "1.1rem", color: "var(--text2)", fontStyle: "italic" }}>Interviewees / Participants</div>
+                  <div style={{ fontSize: "0.7rem", color: "var(--muted)", marginTop: "2px" }}>Used for the Moral Rights line. QID enables <code>{"{{Wikidata|QID}}"}</code>.</div>
+                </div>
+                <button className="btn-primary" onClick={addInterviewee}>+ Add Person</button>
+              </div>
+
+              {record.interviewees.length === 0 && (
+                <div style={{ textAlign: "center", padding: "2.5rem 1rem", color: "var(--muted)", background: "var(--surface2)", borderRadius: "8px", fontSize: "0.85rem", border: "2px dashed var(--border)" }}>
+                  No participants added. Click "+ Add Person" to start.
+                </div>
+              )}
+
+              {record.interviewees.map((ie, idx) => (
+                <div key={idx} style={{ background: "var(--surface2)", border: "1.5px solid var(--border)", borderRadius: "8px", padding: "1rem", marginBottom: "0.75rem", position: "relative" }}>
+                  <button onClick={() => removeIE(idx)} style={{ position: "absolute", top: "0.75rem", right: "0.75rem", background: "none", border: "none", cursor: "pointer", color: "var(--muted)", fontSize: "1.2rem", lineHeight: 1 }}>×</button>
+                  <div style={G2}>
+                    <Field label={`Person ${idx + 1} — Full Name`}><FInput value={ie.fullName} onChange={v => updateIE(idx, "fullName", v)} placeholder="Dinabandhu Gamango" /></Field>
+                    <Field label="Wikidata QID" help="e.g. Q138978470 — unlocks {{Wikidata|QID}} in author field">
+                      <FInput value={ie.wikidataQid} onChange={v => updateIE(idx, "wikidataQid", v)} placeholder="Q138978470" />
+                    </Field>
+                  </div>
+                  <div style={G2}>
+                    <Field label="Gender">
+                      <FSelect value={ie.gender} onChange={v => updateIE(idx, "gender", v)}
+                        options={[{value:"male",label:"Male"},{value:"female",label:"Female"},{value:"non-binary",label:"Non-binary"},{value:"unknown",label:"Unknown"}]} />
+                    </Field>
+                    <Field label="Role"><FInput value={ie.role} onChange={v => updateIE(idx, "role", v)} placeholder="Research participant" /></Field>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ─── SUBTITLES & ORAL HISTORY ─── */}
+        {activeTab === "subtitles" && (
+          <div>
+            <SectionTitle title="Subtitles & Oral History" sub="Subtitle generation and consent / community review framework" />
+            <PreviewBox label="Live preview — generated |Subtitles= field" content={formatSubtitles(record)} />
+
+            <div style={{ fontFamily: "var(--font-display)", fontSize: "1.1rem", color: "var(--text2)", marginBottom: "1rem", fontStyle: "italic" }}>Subtitle Details</div>
+            <div style={G2}>
+              <Field label="Subtitle Language"><FInput value={record.subtitleLanguage} onChange={v => updateField("subtitleLanguage", v)} placeholder="English" /></Field>
+              <Field label="TimedText Page URL or Name" help="Full URL or just TimedText:… page name">
+                <FInput value={record.subtitlePageUrl} onChange={v => updateField("subtitlePageUrl", v)} placeholder="https://commons.wikimedia.org/wiki/TimedText:OpenSpeaks-..." />
+              </Field>
+            </div>
+            <Field label="Subtitle Creators" help="Comma-separated names of people who created the subtitles">
+              <FInput value={record.subtitleCreators} onChange={v => updateField("subtitleCreators", v)} placeholder="Kaliprasad Raji, Uday Raj Aaley" />
+            </Field>
+            <Field label="Editors / Reviewers" help="Use '/' to split editors from reviewers: 'Editor1, Editor2 / Reviewer1'. Without '/', first name = editor, second = reviewer.">
+              <FInput value={record.subtitleEditorsReviewers} onChange={v => updateField("subtitleEditorsReviewers", v)} placeholder="Subhashish Panigrahi / Opino Gomango" />
+            </Field>
+
+            <div style={{ borderTop: "1px solid var(--border)", paddingTop: "1.5rem", marginTop: "1rem" }}>
+              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.1rem", color: "var(--text2)", marginBottom: "1rem", fontStyle: "italic" }}>Parameter 1: Provenance & Consent</div>
+              <div style={G2}>
+                <Field label="Interviewer"><FInput value={record.oralHistory.interviewer} onChange={v => updateOH("interviewer", v)} placeholder="Opino Gomango" /></Field>
+                <Field label="Recorder / Camera Operator"><FInput value={record.oralHistory.recorder} onChange={v => updateOH("recorder", v)} placeholder="Subhashish Panigrahi" /></Field>
+              </div>
+              <div style={G2}>
+                <Field label="Recording Context">
+                  <FSelect value={record.oralHistory.recordingContext} onChange={v => updateOH("recordingContext", v)}
+                    options={[{value:"field_recording",label:"Field Recording"},{value:"studio",label:"Studio"},{value:"remote",label:"Remote/Online"},{value:"other",label:"Other"}]} />
+                </Field>
+                <Field label="Recording Equipment"><FInput value={record.oralHistory.recordingEquipment} onChange={v => updateOH("recordingEquipment", v)} placeholder="Lav mic, Camera" /></Field>
+              </div>
+              <div style={G2}>
+                <Field label="Consent Type">
+                  <FSelect value={record.oralHistory.consentType} onChange={v => updateOH("consentType", v)}
+                    options={[{value:"verbal",label:"Verbal"},{value:"written",label:"Written"},{value:"both",label:"Both (verbal + written)"},{value:"unknown",label:"Unknown"}]} />
+                </Field>
+                <Field label="Consent Record Location"><FInput value={record.oralHistory.consentRecordLocation} onChange={v => updateOH("consentRecordLocation", v)} placeholder="Jholasahi, Gajapati district" /></Field>
+              </div>
+              <div style={{ display: "flex", gap: "1.5rem", flexWrap: "wrap", marginBottom: "1.25rem" }}>
+                <FCheckbox label="Consent Informed" checked={record.oralHistory.consentInformed} onChange={v => updateOH("consentInformed", v)} />
+                <FCheckbox label="Consent Revocable" checked={record.oralHistory.consentRevocable} onChange={v => updateOH("consentRevocable", v)} />
+                <FCheckbox label="Sensitive Content" checked={record.oralHistory.sensitiveContent} onChange={v => updateOH("sensitiveContent", v)} />
+              </div>
+            </div>
+
+            <div style={{ borderTop: "1px solid var(--border)", paddingTop: "1.5rem", marginTop: "0.5rem" }}>
+              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.1rem", color: "var(--text2)", marginBottom: "1rem", fontStyle: "italic" }}>Parameter 2: Community Review</div>
+              <div style={{ marginBottom: "1rem" }}>
+                <FCheckbox label="Community Reviewed" checked={record.oralHistory.communityReviewed} onChange={v => updateOH("communityReviewed", v)} />
+              </div>
+              <div style={G2}>
+                <Field label="Review Date"><FInput value={record.oralHistory.communityReviewDate} onChange={v => updateOH("communityReviewDate", v)} placeholder="2026-05-07" /></Field>
+                <Field label="Reviewer(s)"><FInput value={record.oralHistory.communityReviewers} onChange={v => updateOH("communityReviewers", v)} placeholder="Opino Gomango" /></Field>
+              </div>
+              <Field label="Review Notes"><FTextarea value={record.oralHistory.communityReviewNotes} onChange={v => updateOH("communityReviewNotes", v)} rows={3} placeholder="Notes about the community review process..." /></Field>
+            </div>
+
+            <div style={{ borderTop: "1px solid var(--border)", paddingTop: "1.5rem", marginTop: "0.5rem" }}>
+              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.1rem", color: "var(--text2)", marginBottom: "1rem", fontStyle: "italic" }}>Parameter 3: Transcription</div>
+              <div style={{ marginBottom: "1rem" }}>
+                <FCheckbox label="Transcript Available" checked={record.oralHistory.transcriptAvailable} onChange={v => updateOH("transcriptAvailable", v)} />
+              </div>
+              <div style={G2}>
+                <Field label="Transcript Language(s)"><FInput value={record.oralHistory.transcriptLanguages} onChange={v => updateOH("transcriptLanguages", v)} placeholder="English, Juray" /></Field>
+                <Field label="Transcript Date"><FInput value={record.oralHistory.transcriptDate} onChange={v => updateOH("transcriptDate", v)} placeholder="2026-04-08" /></Field>
+              </div>
+              <div style={G2}>
+                <Field label="Transcript Writer"><FInput value={record.oralHistory.transcriptWriter} onChange={v => updateOH("transcriptWriter", v)} /></Field>
+                <Field label="Transcript Editor"><FInput value={record.oralHistory.transcriptEditor} onChange={v => updateOH("transcriptEditor", v)} /></Field>
+              </div>
+              <Field label="Transcript Link"><FInput value={record.oralHistory.transcriptLink} onChange={v => updateOH("transcriptLink", v)} placeholder="https://commons.wikimedia.org/wiki/TimedText:..." /></Field>
+            </div>
+          </div>
+        )}
+
+        {/* ─── LICENSE & CATEGORIES ─── */}
+        {activeTab === "license" && (
+          <div>
+            <SectionTitle title="License & Categories" sub="Framework parameters and Wikimedia Commons categorization" />
+            <Field label="License">
+              <FSelect value={record.license} onChange={v => updateField("license", v)}
+                options={[
+                  {value:"cc-by-sa-4.0",label:"CC BY-SA 4.0 (recommended for oral history)"},
+                  {value:"cc-by-4.0",label:"CC BY 4.0"},
+                  {value:"cc-zero",label:"CC0 (Public Domain Dedication)"},
+                  {value:"cc-by-sa-3.0",label:"CC BY-SA 3.0"},
+                  {value:"cc-by-3.0",label:"CC BY 3.0"},
+                ]} />
+            </Field>
+
+            <div style={{ background: "var(--accent-light)", border: "1px solid rgba(180,83,9,.25)", borderRadius: "10px", padding: "1.5rem", marginBottom: "2rem" }}>
+              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.1rem", color: "#92400e", marginBottom: "1rem", fontStyle: "italic" }}>OpenSpeaks Framework Parameters</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+                <FCheckbox label="P1: Provenance & Consent — The recording has documented consent and clear provenance" checked={record.framework_p1} onChange={v => updateField("framework_p1", v)} />
+                <FCheckbox label="P2: Community Review — Content has been reviewed by the documented language community" checked={record.framework_p2} onChange={v => updateField("framework_p2", v)} />
+                <FCheckbox label="P3: Multilingual Transcription — Subtitles or transcripts are available in at least one language" checked={record.framework_p3} onChange={v => updateField("framework_p3", v)} />
+              </div>
+            </div>
+
+            <Field label="Categories" help="One category per line (or comma-separated). Do not include [[Category: ]] brackets.">
+              <FTextarea value={record.categories} onChange={v => updateField("categories", v)} rows={12}
+                placeholder={"Juray language\nDinabandhu Gamango\nOpino Gomango\nOral history\nFiles uploaded from OpenSpeaks Archives in 2026\nMedia related to WMF grant ID G-GS-2502-18088"} />
+            </Field>
+          </div>
+        )}
+
+        {/* ─── IMPORT ─── */}
+        {activeTab === "import" && (
+          <div>
+            <SectionTitle title="Import" sub="Populate the form from an existing file or pasted wikitext" />
+
+            {parseMsg.type === "error" && (
+              <div style={{ background: "#fef2f2", border: "1px solid #fca5a5", borderRadius: "8px", padding: ".75rem 1rem", marginBottom: "1.5rem", color: "var(--error)", fontSize: ".85rem" }}>⚠️ {parseMsg.text}</div>
+            )}
+            {parseMsg.type === "success" && (
+              <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: "8px", padding: ".75rem 1rem", marginBottom: "1.5rem", color: "var(--success)", fontSize: ".85rem" }}>{parseMsg.text}</div>
+            )}
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "1rem", marginBottom: "2.5rem" }}>
+              {[
+                { label: "OpenSpeaks JSON", sub: ".json", icon: "📄", accept: ".json", handler: e => handleFileImport(e, importOpenSpeaksJSON, "OpenSpeaks JSON") },
+                { label: "OPEX / IMDI 3.0", sub: ".opex or .xml", icon: "🗂️", accept: ".opex,.xml", handler: e => handleFileImport(e, parseOpexToRecord, "OPEX/IMDI file") },
+                { label: "BLAM / CMDI", sub: ".jsonld or .json", icon: "🔗", accept: ".jsonld,.json", handler: e => handleFileImport(e, parseBlamToRecord, "BLAM/CMDI file") },
+              ].map(({ label, sub, icon, accept, handler }) => (
+                <label key={label} className="import-zone">
+                  <span style={{ fontSize: "2rem" }}>{icon}</span>
+                  <div style={{ fontWeight: 600, color: "var(--text2)" }}>{label}</div>
+                  <div style={{ fontSize: "0.7rem" }}>{sub}</div>
+                  <input type="file" accept={accept} onChange={handler} style={{ display: "none" }} />
+                </label>
+              ))}
+            </div>
+
+            <div style={{ borderTop: "1px solid var(--border)", paddingTop: "1.75rem" }}>
+              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.2rem", color: "var(--text2)", marginBottom: "0.4rem", fontStyle: "italic" }}>Paste Commons Wikitext</div>
+              <p style={{ fontSize: "0.78rem", color: "var(--muted)", margin: "0 0 1rem 0", lineHeight: 1.5 }}>
+                Paste a full Commons file description page (with <code>{"{{Information}}"}</code> and/or <code>{"{{OpenSpeaks}}"}</code>) to auto-populate all form fields. The parser handles nested templates, subtitles, framework parameters, and oral history tables.
+              </p>
+              <FTextarea value={pasteInput} onChange={setPasteInput} rows={16}
+                placeholder={`=={{int:filedesc}}==\n{{Information\n|description=\n{{OpenSpeaks\n|description=In this video...\n|Project_name=OpenSpeaks Archives\n|Language=Juray (ISO 639: juy)\n|Location=Jholasahi, Gajapati district, Odisha, India\n|Runtime=2:25 min\n|Genre=Documentary\n|Subtitles=In [[TimedText:OpenSpeaks-juy-...en.srt|English]] by Creator; Editor (editor)\n|Framework_p1=yes\n|Framework_p2=yes\n|Framework_p3=yes\n}}\n|date=2026-04-07\n|source={{own}}\n|author=\n; Moral Rights: {{Wikidata|Q138978470}}\n; Copyright: [[User:SubhashishPanigrahi]]\n}}\n\n{{self|cc-by-sa-4.0}}\n\n[[Category:Juray language]]`}
+              />
+              <div style={{ display: "flex", gap: "0.75rem", marginTop: "1rem" }}>
+                <button className="btn-primary" onClick={handleParseWikitext}>⚡ Parse into form</button>
+                <button className="btn-sec" onClick={() => { setPasteInput(""); setParseMsg({}); }}>Clear</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ─── PREVIEW & EXPORT ─── */}
+        {activeTab === "export" && (
+          <div>
+            <SectionTitle title="Preview & Export" sub="Review the generated output and download in your chosen format" />
+
+            <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1.25rem", flexWrap: "wrap", alignItems: "center" }}>
+              {[
+                { id: "wikicode", label: "{{}} Wikicode" },
+                { id: "json", label: "{ } JSON" },
+                { id: "markdown", label: "✦ Markdown" },
+                { id: "html", label: "<> HTML" },
+              ].map(f => (
+                <button key={f.id} className={`efmt-btn ${exportFmt === f.id ? "active" : ""}`} onClick={() => setExportFmt(f.id)}>{f.label}</button>
+              ))}
+              <div style={{ flex: 1 }} />
+              <button className="btn-sec" onClick={copyOutput}>{copied ? "✓ Copied!" : "📋 Copy"}</button>
+              <button className="btn-primary" onClick={downloadOutput}>⬇ Download</button>
+            </div>
+
+            <pre style={{ fontFamily: "var(--font-mono)", fontSize: "0.7rem", lineHeight: 1.75, whiteSpace: "pre-wrap", wordBreak: "break-all", background: "#1a120b", color: "#f5e6d8", padding: "1.5rem", borderRadius: "10px", maxHeight: "55vh", overflowY: "auto", margin: "0 0 1.25rem 0" }}>{generatedOutput}</pre>
+
+            <div style={{ background: "var(--surface2)", borderRadius: "8px", padding: "1rem 1.25rem", fontSize: "0.75rem", color: "var(--muted)", lineHeight: 1.6 }}>
+              <strong style={{ color: "var(--text2)" }}>Format notes:</strong> <strong>Wikicode</strong> generates the full Commons file description page with <code>{"{{Information}}"}</code>, nested <code>{"{{OpenSpeaks}}"}</code>, oral history tables (P1–P3), license, and categories. <code>|Copyright_holder=</code> is intentionally omitted from <code>{"{{OpenSpeaks}}"}</code> — copyright is surfaced in <code>|author=</code> instead. <strong>JSON</strong> uses the OpenSpeaks v1.2 schema and can be re-imported. <strong>Markdown</strong> and <strong>HTML</strong> are human-readable reference formats.
+            </div>
+          </div>
+        )}
+            </main>
+
+      {/* ── Footer ── */}
+      <footer
+        style={{
+          borderTop: "1px solid var(--border)",
+          padding: "0.85rem 1.5rem 1.25rem 1.5rem",
+          fontSize: "0.72rem",
+          color: "var(--muted)",
+          background: "var(--surface2)",
+        }}
+      >
+        <div style={{ maxWidth: "920px", margin: "0 auto" }}>
+          <div style={{ marginBottom: "0.25rem" }}>
+            This tool helps create and edit metadata for audio, video, images and documents
+            related to oral knowledge. You can also import and export metadata from
+            OpenSpeaks Archives, Wikimedia Commons (wikitext), Endangered Languages Archive
+            (Lameta/OPEX), and Language Archive Cologne (BLAM).
+          </div>
+          <div>
+            Version {APP_VERSION} (Schema {SCHEMA_VERSION}) ·{" "}
+            <span>
+              Under{" "}
+              {/* Replace href once you have the actual GitHub repo URL */}
+              <a
+                href="https://opensource.org/license/mit"
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: "var(--accent2)", textDecoration: "none" }}
+              >
+                MIT License
+              </a>
+            </span>
+            {" · "}
+            <a
+              href="https://github.com/openspeaks/metadata-generator"
+              target="_blank"
+              rel="noreferrer"
+              style={{ color: "var(--accent2)", textDecoration: "none" }}
+            >
+              GitHub repository
+            </a>
+          </div>
+        </div>
+      </footer>
+    </div>
+  );
+}
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(<App />);
+    </script>
+  </body>
+</html>
