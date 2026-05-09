@@ -9,6 +9,8 @@
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <!-- Babel to compile JSX in-browser -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Mammoth for .docx text extraction -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
   </head>
   <body style="margin:0;">
     <div id="root"></div>
@@ -206,6 +208,257 @@ function parseWikitextIntoRecord(wikitext) {
   if (Object.keys(ohResult).length) result.oralHistory = ohResult;
 
   return result;
+}
+
+// ============================================================
+// PLAIN-TEXT / BASIC METADATA PARSER
+// Handles key–value plain text where fields are separated by
+// colons, tabs, or (for known identifiers) a single space.
+// Also handles wiki-table rows (| Field || Value) embedded in
+// plain-text exports and simple oral-history tables.
+// ============================================================
+function parsePlainTextToRecord(text) {
+  const result = {};
+  const ohResult = {};
+  const lines = text.split(/\r?\n/);
+
+  const norm = k => k.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+  // Field-name → record key mapping
+  const FIELD_MAP = {
+    description: "description",
+    projectfilmname: "projectName", projectname: "projectName", filmname: "projectName",
+    cast: "cast",
+    interviewlocation: "recordingPlace", recordinglocation: "recordingPlace",
+    location: "recordingPlace", dialect: "recordingPlace",
+    language: "language", languageiso: "languageISO", languageiso639: "languageISO",
+    runtime: "duration", duration: "duration",
+    color: "color", colour: "color",
+    sound: "sound",
+    genre: "genre",
+    topic: "topic",
+    releasedate: "releaseDate", recordingdate: "releaseDate",
+    date: "date",
+    doieidr: "doi", doi: "doi", eidr: "doi",
+    imdb: "imdb", imdbid: "imdb",
+    isrc: "isrc",
+    producer: "producer",
+    director: "director",
+    writer: "writer",
+    cinematographer: "cinematographer",
+    editor: "editor",
+    recordist: "recordist", recorderoperator: "recordist",
+    copyrightholder: "copyrightHolder",
+    source: "source",
+    author: "_author",
+    subtitles: "_subtitles",
+    subtitlescreatoreditor: "_subtitles",
+    subtitledetails: "_subtitles",
+    interviewee: "cast", interviewees: "cast",
+    projectname2: "projectName",
+  };
+
+  // OH field-name → oralHistory key
+  const OH_MAP = {
+    consenttype: "consentType",
+    consentinformed: "consentInformed",
+    consentrevocable: "consentRevocable",
+    sensitivecontent: "sensitiveContent",
+    consentrecordlocation: "consentRecordLocation",
+    communityreviewed: "communityReviewed",
+    reviewdate: "communityReviewDate",
+    reviewers: "communityReviewers",
+    "reviewer(s)": "communityReviewers",
+    reviewnotes: "communityReviewNotes",
+    "speaker(s)": "_speakers", speakers: "_speakers", speaker: "_speakers",
+    "speakerrole(s)": "_speakerRoles", speakerroless: "_speakerRoles", speakerrole: "_speakerRoles",
+    interviewer: "interviewer",
+    recorderoperator: "recorder", "recorderoperator": "recorder",
+    recorder: "recorder",
+    recordingcontext: "recordingContext",
+    recordingequipment: "recordingEquipment", equipment: "recordingEquipment",
+    subtitlesavailable: "subtitlesAvailable",
+    transcriptavailable: "transcriptAvailable",
+    transcriptlanguages: "transcriptLanguages",
+    "transcriptlanguage(s)": "transcriptLanguages",
+    transcriptdetails: "_transcriptDetails",
+    subtitledetails: "_subtitleDetailsOH",
+  };
+
+  function applyOHField(key, value) {
+    const nk = norm(key);
+    const ohKey = OH_MAP[nk] || OH_MAP[key.toLowerCase().trim()];
+    if (!ohKey) return;
+    if (ohKey === "_speakers") {
+      // "Dinabandhu Gamango (male)" → parse into interviewees
+      if (!result.interviewees) result.interviewees = [];
+      value.split(",").forEach(s => {
+        const m = s.trim().match(/^(.+?)\s*\((\w+)\)$/);
+        if (m) result.interviewees.push({ fullName: m[1].trim(), wikidataQid: "", gender: m[2].toLowerCase(), role: "Participant" });
+        else if (s.trim()) result.interviewees.push({ fullName: s.trim(), wikidataQid: "", gender: "unknown", role: "Participant" });
+      });
+    } else if (ohKey === "_speakerRoles") {
+      // e.g. "Gamango (Native speaker, interviewee)" → update last interviewee role
+      if (result.interviewees?.length) {
+        result.interviewees[result.interviewees.length - 1].role = value;
+      }
+    } else if (ohKey === "_transcriptDetails") {
+      // "by X, edited by Y, published 2026-04-08, (URL)"
+      const byM = value.match(/^by\s+([^,]+)/i); if (byM) ohResult.transcriptWriter = byM[1].trim();
+      const edM = value.match(/edited by\s+([^,]+)/i); if (edM) ohResult.transcriptEditor = edM[1].trim();
+      const dtM = value.match(/published\s+([\d-]+)/i); if (dtM) ohResult.transcriptDate = dtM[1];
+      const urlM = value.match(/\((https?[^)]+)\)/); if (urlM) ohResult.transcriptLink = urlM[1];
+      ohResult.transcriptAvailable = true;
+    } else if (ohKey === "_subtitleDetailsOH") {
+      // just store raw; subtitle details go into record fields
+      parseSubtitleString(result, value);
+    } else if (ohKey === "consentInformed" || ohKey === "consentRevocable" || ohKey === "sensitiveContent" || ohKey === "communityReviewed" || ohKey === "transcriptAvailable" || ohKey === "subtitlesAvailable") {
+      ohResult[ohKey] = /^yes$/i.test(value.trim());
+    } else {
+      ohResult[ohKey] = value;
+    }
+  }
+
+  function parseSubtitleString(res, val) {
+    // e.g. "In English by Name1 (creator), Name2 (reviewer), Subhashish Panigrahi (editor)"
+    // e.g. "In [[TimedText:...|English]] by Name1, Name2; Name3 (editor)"
+    const langM = val.match(/^In\s+(?:\[\[(?:TimedText:[^\|]*)\|)?([^\]]+)\]?\]?\s+by\s+/i);
+    if (langM) res.subtitleLanguage = langM[1].trim();
+    const timedM = val.match(/\[\[TimedText:([^\|]+)\|/);
+    if (timedM) res.subtitlePageUrl = timedM[1].trim();
+    const byM = val.match(/by\s+(.+)$/is);
+    if (byM) {
+      const rest = byM[1];
+      // split into creators / editors / reviewers by role labels
+      const creators = []; const editors = []; const reviewers = [];
+      rest.split(/[;,]/).forEach(part => {
+        const p = part.trim();
+        if (!p) return;
+        if (/\(creator\)/i.test(p)) creators.push(p.replace(/\(creator\)/i, "").trim());
+        else if (/\(editor\)/i.test(p)) editors.push(p.replace(/\(editor\)/i, "").trim());
+        else if (/\(reviewer\)/i.test(p)) reviewers.push(p.replace(/\(reviewer\)/i, "").trim());
+        else creators.push(p);
+      });
+      if (creators.length) res.subtitleCreators = creators.join(", ");
+      const erParts = [];
+      if (editors.length) erParts.push(editors.join(", "));
+      if (reviewers.length) erParts.push(reviewers.join(", "));
+      if (erParts.length) res.subtitleEditorsReviewers = erParts.join(" / ");
+    }
+  }
+
+  function applyMainField(key, value) {
+    const nk = norm(key);
+    const mapped = FIELD_MAP[nk];
+    if (!mapped) return false;
+    if (mapped === "_author") {
+      // "Moral Rights: X ; Copyright: Y" or just a plain name
+      const copyUserM = value.match(/Copyright[^:]*:\s*\[\[User:([^\]|]+)/i);
+      if (copyUserM) result.authorUsername = copyUserM[1].trim();
+      const copyNameM = value.match(/Copyright[^:]*:\s*(?!\[\[)([^;\n]+)/i);
+      if (copyNameM && !copyUserM) result.copyrightHolder = copyNameM[1].trim();
+      // Extract wikidata-linked moral rights names
+      const moralM = value.match(/Moral Rights[^:]*:\s*(.+?)(?:;|Copyright|$)/i);
+      if (moralM) {
+        const qdParts = [...moralM[1].matchAll(/wikidata:?(Q\d+)/gi)];
+        if (qdParts.length && !result.interviewees?.length) {
+          result.interviewees = qdParts.map(m => ({ fullName: "", wikidataQid: m[1], gender: "unknown", role: "Participant" }));
+        }
+      }
+      return true;
+    }
+    if (mapped === "_subtitles") { parseSubtitleString(result, value); return true; }
+    // Strip parenthetical abbreviations e.g. "Subhashish Panigrahi (SP)"
+    const cleanVal = value.replace(/\s*\(\w{1,3}\)\s*$/, "").trim();
+    result[mapped] = cleanVal;
+    return true;
+  }
+
+  let inOralHistory = false;
+  let inDescriptionBlock = false;
+  const descLines = [];
+
+  for (let li = 0; li < lines.length; li++) {
+    const raw = lines[li];
+    const trimmed = raw.trim();
+
+    // Skip empty lines (but track end of description block)
+    if (!trimmed) { if (inDescriptionBlock && descLines.length) inDescriptionBlock = false; continue; }
+
+    // Section headers — detect and skip
+    if (/^metadata\s*$/i.test(trimmed)) continue;
+    if (/^(updated\s+\d|parameter\s+[123]|field\s+value|!\s*field|openspeaks oral|oral history doc)/i.test(trimmed)) {
+      if (/parameter\s+1/i.test(trimmed)) inOralHistory = true;
+      if (/parameter\s+[23]/i.test(trimmed)) inOralHistory = true;
+      continue;
+    }
+    if (/^={1,3}[^=]/.test(trimmed)) continue; // wiki headings
+    if (/^\|-$/.test(trimmed) || /^\{\|/.test(trimmed) || /^\|\}/.test(trimmed)) continue;
+
+    // Wiki-table value row: "| Field || Value"
+    const wikiRowM = raw.match(/^\|\s*([^|]+?)\s*\|\|\s*(.+)/);
+    if (wikiRowM) {
+      const key = wikiRowM[1].trim(); const val = wikiRowM[2].trim();
+      if (!/^field$/i.test(key)) {
+        if (!applyMainField(key, val)) applyOHField(key, val);
+      }
+      continue;
+    }
+
+    // Description block detection (line reads just "Description" or "Description:")
+    if (/^description\s*:?\s*$/i.test(trimmed)) { inDescriptionBlock = true; continue; }
+    if (inDescriptionBlock) { descLines.push(trimmed); continue; }
+
+    // "Description\tContent" or "Description: Content" on one line
+    const descInlineM = trimmed.match(/^description\s*[:|\t]\s*(.+)/i);
+    if (descInlineM) { result.description = descInlineM[1].trim(); continue; }
+
+    // Tab-separated: "Field\tValue"
+    if (raw.includes("\t")) {
+      const parts = raw.split("\t");
+      const key = parts[0].trim(); const val = parts.slice(1).join("\t").trim();
+      if (key && val && !/^(field|value)$/i.test(key)) {
+        if (!applyMainField(key, val)) applyOHField(key, val);
+      }
+      continue;
+    }
+
+    // "Key: Value" — colon separated
+    const colonM = trimmed.match(/^([^:]{2,50}?)\s*:\s*(.+)$/);
+    if (colonM) {
+      const key = colonM[1].trim(); const val = colonM[2].trim();
+      if (!applyMainField(key, val)) applyOHField(key, val);
+      continue;
+    }
+
+    // "IMDb tt14546228" — space-separated known identifiers
+    const spaceIdM = trimmed.match(/^(imdb|doi|eidr|isrc)\s+(\S+)/i);
+    if (spaceIdM) { applyMainField(spaceIdM[1], spaceIdM[2]); continue; }
+  }
+
+  if (descLines.length && !result.description) result.description = descLines.join(" ");
+  if (Object.keys(ohResult).length) result.oralHistory = ohResult;
+
+  // Infer framework params from parsed OH data
+  if (ohResult.consentType || ohResult.consentRecordLocation) result.framework_p1 = true;
+  if (ohResult.communityReviewed) result.framework_p2 = true;
+  if (ohResult.transcriptAvailable || result.subtitlePageUrl || result.subtitleCreators) result.framework_p3 = true;
+
+  return Object.keys(result).length > 1 ? result : null;
+}
+
+// Auto-detect input format and dispatch to the right parser
+function parseAnyInput(text) {
+  const t = text.trim();
+  // Wikitext: has {{Information or {{OpenSpeaks template markers
+  if (/\{\{\s*information/i.test(t) || /\{\{\s*openspeaks/i.test(t) || /\{\{self\|/i.test(t)) {
+    return { result: parseWikitextIntoRecord(t), format: "Commons wikitext" };
+  }
+  // Try plain text
+  const ptResult = parsePlainTextToRecord(t);
+  if (ptResult) return { result: ptResult, format: "plain-text metadata" };
+  // Fallback: still attempt wikitext (returns null if it can't find {{Information}})
+  return { result: parseWikitextIntoRecord(t), format: "wikitext" };
 }
 
 // ============================================================
@@ -781,8 +1034,8 @@ function App() {
 
   const handleParseWikitext = () => {
     setParseMsg({});
-    const parsed = parseWikitextIntoRecord(pasteInput);
-    applyParsed(parsed, "pasted wikitext");
+    const { result: parsed, format } = parseAnyInput(pasteInput);
+    applyParsed(parsed, format);
   };
 
   const handleFileImport = (e, adapter, label) => {
@@ -1131,7 +1384,7 @@ function App() {
         {/* ─── IMPORT ─── */}
         {activeTab === "import" && (
           <div>
-            <SectionTitle title="Import" sub="Populate the form from an existing file or pasted wikitext" />
+            <SectionTitle title="Import" sub="Populate the form from a file, pasted wikitext, or plain-text metadata" />
 
             {parseMsg.type === "error" && (
               <div style={{ background: "#fef2f2", border: "1px solid #fca5a5", borderRadius: "8px", padding: ".75rem 1rem", marginBottom: "1.5rem", color: "var(--error)", fontSize: ".85rem" }}>⚠️ {parseMsg.text}</div>
@@ -1156,16 +1409,63 @@ function App() {
             </div>
 
             <div style={{ borderTop: "1px solid var(--border)", paddingTop: "1.75rem" }}>
-              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.2rem", color: "var(--text2)", marginBottom: "0.4rem", fontStyle: "italic" }}>Paste Commons Wikitext</div>
-              <p style={{ fontSize: "0.78rem", color: "var(--muted)", margin: "0 0 1rem 0", lineHeight: 1.5 }}>
-                Paste a full Commons file description page (with <code>{"{{Information}}"}</code> and/or <code>{"{{OpenSpeaks}}"}</code>) to auto-populate all form fields. The parser handles nested templates, subtitles, framework parameters, and oral history tables.
+              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.2rem", color: "var(--text2)", marginBottom: "0.4rem", fontStyle: "italic" }}>Paste Wikitext or Plain-Text Metadata</div>
+              <p style={{ fontSize: "0.78rem", color: "var(--muted)", margin: "0 0 0.6rem 0", lineHeight: 1.6 }}>
+                Paste text from <strong>any</strong> of these sources — the tool auto-detects the format and fills the form:
               </p>
+              <ul style={{ fontSize: "0.76rem", color: "var(--muted)", margin: "0 0 1rem 1.25rem", padding: 0, lineHeight: 1.9 }}>
+                <li><strong>Commons wikitext</strong> — a full file-description page with <code>{"{{Information}}"}</code> and/or <code>{"{{OpenSpeaks}}"}</code></li>
+                <li><strong>Plain-text metadata</strong> — fields separated by colons, tabs, or spaces (e.g. <code>Language: Juray</code>), including exports from spreadsheets or notes</li>
+                <li><strong>.txt or .docx file</strong> — upload using the buttons below; text is extracted and parsed automatically</li>
+              </ul>
+              <div style={{ display: "flex", gap: "0.75rem", marginBottom: "1rem", flexWrap: "wrap" }}>
+                <label className="import-zone" style={{ flex: "1 1 160px", padding: "0.9rem 0.75rem", gap: "0.3rem" }}>
+                  <span style={{ fontSize: "1.5rem" }}>📄</span>
+                  <div style={{ fontWeight: 600, fontSize: "0.78rem", color: "var(--text2)" }}>Upload .txt file</div>
+                  <div style={{ fontSize: "0.68rem" }}>Plain-text metadata or wikitext</div>
+                  <input type="file" accept=".txt" style={{ display: "none" }} onChange={e => {
+                    const file = e.target.files[0]; if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = ev => {
+                      const text = ev.target.result;
+                      setPasteInput(text);
+                      const { result: parsed, format } = parseAnyInput(text);
+                      applyParsed(parsed, `plain-text file "${file.name}"`);
+                    };
+                    reader.readAsText(file); e.target.value = "";
+                  }} />
+                </label>
+                <label className="import-zone" style={{ flex: "1 1 160px", padding: "0.9rem 0.75rem", gap: "0.3rem" }}>
+                  <span style={{ fontSize: "1.5rem" }}>📝</span>
+                  <div style={{ fontWeight: 600, fontSize: "0.78rem", color: "var(--text2)" }}>Upload .docx file</div>
+                  <div style={{ fontSize: "0.68rem" }}>Word document — text extracted via Mammoth</div>
+                  <input type="file" accept=".docx" style={{ display: "none" }} onChange={e => {
+                    const file = e.target.files[0]; if (!file) return;
+                    if (typeof mammoth === "undefined") {
+                      setParseMsg({ type: "error", text: "Mammoth library not loaded yet. Try refreshing the page." }); return;
+                    }
+                    const reader = new FileReader();
+                    reader.onload = ev2 => {
+                      mammoth.extractRawText({ arrayBuffer: ev2.target.result })
+                        .then(res2 => {
+                          const text = res2.value;
+                          setPasteInput(text);
+                          const { result: parsed, format } = parseAnyInput(text);
+                          applyParsed(parsed, `Word document "${file.name}"`);
+                        })
+                        .catch(() => setParseMsg({ type: "error", text: `Could not extract text from "${file.name}". Ensure it is a valid .docx file.` }));
+                    };
+                    reader.readAsArrayBuffer(file); e.target.value = "";
+                  }} />
+                </label>
+              </div>
               <FTextarea value={pasteInput} onChange={setPasteInput} rows={16}
-                placeholder={`=={{int:filedesc}}==\n{{Information\n|description=\n{{OpenSpeaks\n|description=In this video...\n|Project_name=OpenSpeaks Archives\n|Language=Juray (ISO 639: juy)\n|Location=Jholasahi, Gajapati district, Odisha, India\n|Runtime=2:25 min\n|Genre=Documentary\n|Subtitles=In [[TimedText:OpenSpeaks-juy-...en.srt|English]] by Creator; Editor (editor)\n|Framework_p1=yes\n|Framework_p2=yes\n|Framework_p3=yes\n}}\n|date=2026-04-07\n|source={{own}}\n|author=\n; Moral Rights: {{Wikidata|Q138978470}}\n; Copyright: [[User:SubhashishPanigrahi]]\n}}\n\n{{self|cc-by-sa-4.0}}\n\n[[Category:Juray language]]`}
+                placeholder={`Paste wikitext OR plain-text metadata here. Examples:\n\n── Commons wikitext ──────────────────────\n=={{int:filedesc}}==\n{{Information\n|description=\n{{OpenSpeaks\n|description=In this video...\n|Language=Juray (ISO 639: juy)\n|Location=Jholasahi, Gajapati district, Odisha, India\n|Runtime=2:25 min\n|Framework_p1=yes\n|Framework_p2=yes\n|Framework_p3=yes\n}}\n|date=2026-04-07\n|author=\n; Moral Rights: {{Wikidata|Q138978470}}\n; Copyright: [[User:SubhashishPanigrahi]]\n}}\n{{self|cc-by-sa-4.0}}\n[[Category:Juray language]]\n\n── Plain-text metadata ───────────────────\nProject/Film name: OpenSpeaks Archives\nCast: Dinabandhu Gamango\nLanguage: Juray (ISO 639: juy)\nRuntime: 2:25 min\nGenre: Documentary\nIMDb tt14546228\nProducer: Subhashish Panigrahi\nSubtitles: In English by Name1 (creator), Name2 (editor)`}
               />
-              <div style={{ display: "flex", gap: "0.75rem", marginTop: "1rem" }}>
+              <div style={{ display: "flex", gap: "0.75rem", marginTop: "1rem", flexWrap: "wrap", alignItems: "center" }}>
                 <button className="btn-primary" onClick={handleParseWikitext}>⚡ Parse into form</button>
                 <button className="btn-sec" onClick={() => { setPasteInput(""); setParseMsg({}); }}>Clear</button>
+                <span style={{ fontSize: "0.7rem", color: "var(--muted)", marginLeft: "0.25rem" }}>Format is auto-detected: wikitext or plain-text.</span>
               </div>
             </div>
           </div>
