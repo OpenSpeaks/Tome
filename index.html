@@ -17,20 +17,10 @@
 
     <!-- Your JSX app -->
     <script type="text/babel">
-      // Paste the entire contents of openspeaks-metadata-generator.jsx here.
-      // Ensure the first line is:
-      // const { useState, useCallback, useMemo, useEffect } = React;
-      //
-      // Replace:
-      // import { useState, useCallback, useMemo, useEffect } from "react";
-      // with the line above.
-
-      // After pasting and adjusting the first line, at the very end add:
-
       const { useState, useCallback, useMemo, useEffect } = React;
 
 const SCHEMA_VERSION = "1.2";
-const APP_VERSION = "0.1.0-alpha";
+const APP_VERSION = "0.1.1-beta";
 
 // ============================================================
 // OpenSpeaks Metadata Generator is an open source tool published by OpenSpeaks and maintained by Subhashish Panigrahi. Published under the MIT License. Updated 7 May 2026.
@@ -51,6 +41,7 @@ const defaultRecord = {
   _version: SCHEMA_VERSION, _exportedAt: "",
   fileName: "", fileType: "video", duration: "", color: "Color", sound: "Stereo",
   isOpenSpeaks: true, title: "", originalTitle: "", year: "", description: "",
+  extraDescriptions: [],
   projectName: "", cast: "", country: "India", language: "", languageISO: "",
   dialect: "", recordingPlace: "", studio: "", producer: "", director: "",
   writer: "", cinematographer: "", editor: "", recordist: "",
@@ -112,6 +103,32 @@ function findAllTemplates(text) {
   return results;
 }
 
+
+// Top-level subtitle string parser (shared by wikitext + plain-text parsers)
+function parseSubtitleStringIntoRecord(res, val) {
+  if (!val) return;
+  const langM = val.match(/^In\s+(?:\[\[(?:TimedText:[^|]*)\|)?([^\]]+)\]?\]?\s+by\s+/i);
+  if (langM) res.subtitleLanguage = langM[1].trim();
+  const timedM = val.match(/\[\[TimedText:([^|]+)\|/);
+  if (timedM) res.subtitlePageUrl = timedM[1].trim();
+  const byM = val.match(/by\s+(.+)$/is);
+  if (byM) {
+    const rest = byM[1];
+    const creators = []; const editors = []; const reviewers = [];
+    rest.split(/[;,]/).forEach(part => {
+      const p2 = part.trim(); if (!p2) return;
+      if (/\(creator\)/i.test(p2)) creators.push(p2.replace(/\(creator\)/i, "").trim());
+      else if (/\(editor\)/i.test(p2)) editors.push(p2.replace(/\(editor\)/i, "").trim());
+      else if (/\(reviewer\)/i.test(p2)) reviewers.push(p2.replace(/\(reviewer\)/i, "").trim());
+      else creators.push(p2);
+    });
+    if (creators.length) res.subtitleCreators = creators.join(", ");
+    const erParts = [];
+    if (editors.length) erParts.push(editors.join(", "));
+    if (reviewers.length) erParts.push(reviewers.join(", "));
+    if (erParts.length) res.subtitleEditorsReviewers = erParts.join(" / ");
+  }
+}
 function parseWikitextIntoRecord(wikitext) {
   const topTemplates = findAllTemplates(wikitext);
   const infoTpl = topTemplates.find(t => /^information$/i.test(t.name.trim()));
@@ -148,13 +165,25 @@ function parseWikitextIntoRecord(wikitext) {
   const descTemplates = findAllTemplates(descRaw);
   const osTpl = descTemplates.find(t => /openspeaks/i.test(t.name));
 
+  // Also parse multilingual description wrappers {{en|1=...}} {{hi|1=...}}
+  const multiDesc = parseMultilangDesc(descRaw);
+  const enDesc = multiDesc.find(d => d.langCode === "en") || multiDesc[0] || { langCode: "en", text: "" };
+  result.extraDescriptions = multiDesc.filter((_, i) => i > 0 || (multiDesc.length > 1 && multiDesc[0].langCode !== "en"))
+    .filter(d => d.langCode !== "en" || multiDesc.length > 1);
+  // Keep only non-primary descriptions as extras
+  const primaryDesc = enDesc.text;
+  result.extraDescriptions = multiDesc.filter(d => d !== enDesc && d.text.trim());
+
   if (osTpl) {
     const op = osTpl.params;
     result.description = op["description"] || op["_pos1"] || "";
     result.projectName = op["Project_name"] || op["project_name"] || "";
     result.cast = op["cast"] || op["Cast"] || "";
     result.recordingPlace = op["Location"] || "";
-    result.language = op["Language"] || "";
+    const rawLang = op["Language"] || "";
+    const isoLang = extractISO639(rawLang);
+    if (isoLang) { result.language = isoLang.language; result.languageISO = isoLang.languageISO; }
+    else result.language = rawLang;
     result.duration = op["Runtime"] || "";
     result.color = op["Color"] || "Color";
     result.sound = op["Sound"] || "Stereo";
@@ -187,6 +216,34 @@ function parseWikitextIntoRecord(wikitext) {
     }
   }
 
+  // No {{OpenSpeaks}} template — try to extract fields from the description text
+  // (legacy Commons format where metadata is embedded as bullet points)
+  if (!osTpl && primaryDesc) {
+    const { cleanDesc, meta } = stripLegacyMetaFromDesc(primaryDesc);
+    result.description = cleanDesc;
+    const legacyMap = {
+      cast: "cast", country: "country", year: "year", language: "language",
+      runtime: "duration", color: "color", colour: "color", sound: "sound",
+      studio: "projectName", producer: "producer", writer: "writer",
+      cinematographer: "cinematographer", editor: "editor", genre: "genre",
+      topic: "topic", releasedate: "releaseDate", recordist: "recordist",
+      "subtitledby": "_subtitles", "subtitlesby": "_subtitles",
+    };
+    for (const [k, v] of Object.entries(meta)) {
+      const mapped = legacyMap[k.replace(/[\/\s]/g, "").toLowerCase()];
+      if (!mapped) continue;
+      if (mapped === "_subtitles") parseSubtitleStringIntoRecord(result, v);
+      else if (mapped === "language") {
+        const isoD = extractISO639(v);
+        if (isoD) { result.language = isoD.language; result.languageISO = isoD.languageISO; }
+        else result.language = v;
+      } else result[mapped] = v;
+    }
+  } else if (!osTpl && !primaryDesc) {
+    // Description is plain text, no lang wrapper
+    result.description = descRaw;
+  }
+
   // Categories
   const catMatches = [...wikitext.matchAll(/\[\[Category:([^\]]+)\]\]/g)];
   if (catMatches.length) result.categories = catMatches.map(m => m[1].trim()).join("\n");
@@ -195,7 +252,7 @@ function parseWikitextIntoRecord(wikitext) {
   const selfMatch = wikitext.match(/\{\{self\|([^}]+)\}\}/);
   if (selfMatch) result.license = selfMatch[1].trim();
 
-  // Oral history table fields
+  // Oral knowledge table fields
   const ohResult = {};
   const consentTypeMatch = wikitext.match(/\|\s*Consent type\s*\|\|\s*(\w+)/i);
   if (consentTypeMatch) ohResult.consentType = consentTypeMatch[1].toLowerCase();
@@ -208,6 +265,70 @@ function parseWikitextIntoRecord(wikitext) {
   if (Object.keys(ohResult).length) result.oralHistory = ohResult;
 
   return result;
+}
+
+// ============================================================
+// ISO 639 CODE EXTRACTOR
+// Handles: "Juray (ISO 639: juy)", "Juray (juy)", "English (en)"
+// Returns { language, languageISO } or null
+// ============================================================
+function extractISO639(raw) {
+  if (!raw) return null;
+  const full = raw.match(/\(\s*(?:ISO\s*639[-\s:]*\d?\s*:?\s*)?([a-z]{2,3})\s*\)/i);
+  if (full) {
+    const iso = full[1].toLowerCase();
+    const langName2 = raw.slice(0, full.index).trim().replace(/[,;]+$/, "").trim();
+    return { language: langName2 || raw, languageISO: iso };
+  }
+  return null;
+}
+
+// ============================================================
+// LANGUAGE CODES — world top-10, all 22 Indian official langs,
+// South Asian official langs (Urdu, Nepali, Sinhala, Dhivehi)
+// ============================================================
+const LANG_CODES = [
+  // Top 10 world languages by speakers
+  { code: "zh", name: "Chinese (Mandarin)" },
+  { code: "es", name: "Spanish" },
+  { code: "en", name: "English" },
+  { code: "hi", name: "Hindi" },
+  { code: "ar", name: "Arabic" },
+  { code: "bn", name: "Bengali / Bangla" },
+  { code: "pt", name: "Portuguese" },
+  { code: "ru", name: "Russian" },
+  { code: "ja", name: "Japanese" },
+  { code: "fr", name: "French" },
+  // Indian official languages — 8th Schedule
+  { code: "as", name: "Assamese" },
+  { code: "brx", name: "Bodo" },
+  { code: "doi", name: "Dogri" },
+  { code: "gu", name: "Gujarati" },
+  { code: "kn", name: "Kannada" },
+  { code: "ks", name: "Kashmiri" },
+  { code: "kok", name: "Konkani" },
+  { code: "mai", name: "Maithili" },
+  { code: "ml", name: "Malayalam" },
+  { code: "mni", name: "Meitei (Manipuri)" },
+  { code: "mr", name: "Marathi" },
+  { code: "or", name: "Odia" },
+  { code: "pa", name: "Punjabi / Panjabi" },
+  { code: "sa", name: "Sanskrit" },
+  { code: "sat", name: "Santali" },
+  { code: "sd", name: "Sindhi" },
+  { code: "ta", name: "Tamil" },
+  { code: "te", name: "Telugu" },
+  // South Asian official languages
+  { code: "ne", name: "Nepali" },
+  { code: "si", name: "Sinhala / Sinhalese" },
+  { code: "dv", name: "Dhivehi (Maldivian)" },
+  { code: "ur", name: "Urdu" },
+];
+
+// Return a human-readable name for a code, or the code itself as fallback
+function langName(code) {
+  const entry = LANG_CODES.find(l => l.code.toLowerCase() === (code || "").toLowerCase());
+  return entry ? entry.name : (code || "");
 }
 
 // ============================================================
@@ -368,6 +489,12 @@ function parsePlainTextToRecord(text) {
       return true;
     }
     if (mapped === "_subtitles") { parseSubtitleString(result, value); return true; }
+    if (mapped === "language") {
+      const isoData = extractISO639(value);
+      if (isoData) { result.language = isoData.language; result.languageISO = isoData.languageISO; }
+      else result.language = value;
+      return true;
+    }
     // Strip parenthetical abbreviations e.g. "Subhashish Panigrahi (SP)"
     const cleanVal = value.replace(/\s*\(\w{1,3}\)\s*$/, "").trim();
     result[mapped] = cleanVal;
@@ -387,7 +514,7 @@ function parsePlainTextToRecord(text) {
 
     // Section headers — detect and skip
     if (/^metadata\s*$/i.test(trimmed)) continue;
-    if (/^(updated\s+\d|parameter\s+[123]|field\s+value|!\s*field|openspeaks oral|oral history doc)/i.test(trimmed)) {
+    if (/^(updated\s+\d|parameter\s+[123]|field\s+value|!\s*field|openspeaks oral|oral knowledge doc)/i.test(trimmed)) {
       if (/parameter\s+1/i.test(trimmed)) inOralHistory = true;
       if (/parameter\s+[23]/i.test(trimmed)) inOralHistory = true;
       continue;
@@ -626,6 +753,7 @@ function importOpenSpeaksJSON(raw) {
     title: data.title || "",
     originalTitle: data.originalTitle || "",
     description: data.description || "",
+    extraDescriptions: data.extraDescriptions || [],
     projectName: data.projectName || "",
     cast: data.cast || "",
     country: data.locationCountry || data.country || "",
@@ -703,7 +831,9 @@ function formatSubtitles(record) {
   }
   if (pageName && !pageName.startsWith("TimedText:")) pageName = `TimedText:${pageName}`;
 
-  const timedLink = pageName ? `[[${pageName}|${subtitleLanguage || "Language"}]]` : `[[TimedText:|${subtitleLanguage || "Language"}]]`;
+  // Only emit a [[TimedText:...]] link when we actually have a page name
+  const langLabel = subtitleLanguage || "Language";
+  const timedLink = pageName ? `[[${pageName}|${langLabel}]]` : null;
 
   const creatorList = (subtitleCreators || "").split(",").map(n => n.trim()).filter(Boolean).join(", ");
 
@@ -726,11 +856,61 @@ function formatSubtitles(record) {
     }
   }
 
-  let result = timedLink ? `In ${timedLink} by ${creatorList}` : creatorList;
+  // With a TimedText link: "In [[TimedText:...|English]] by Creator; Editor (editor)"
+  // Without:               "In English by Creator; Editor (editor)"
+  let result;
+  if (timedLink) {
+    result = `In ${timedLink} by ${creatorList}`;
+  } else if (langLabel && creatorList) {
+    result = `In ${langLabel} by ${creatorList}`;
+  } else {
+    result = creatorList;
+  }
   if (editorReviewerList) result += `; ${editorReviewerList}`;
   return result;
 }
 
+
+// Parse "{{en|1=TEXT1}}{{hi|1=TEXT2}}" → [{langCode:"en",text:"TEXT1"}, {langCode:"hi",text:"TEXT2"}]
+// Also plain text with no wrapper → [{langCode:"en", text:rawText}]
+function parseMultilangDesc(raw) {
+  raw = (raw || "").trim();
+  if (!raw) return [];
+  const results = [];
+  const re = /\{\{([a-z]{2,3})\s*\|\s*(?:1=)?([\s\S]+?)\}\}/gi;
+  let match;
+  while ((match = re.exec(raw)) !== null) {
+    results.push({ langCode: match[1].toLowerCase(), text: match[2].trim() });
+  }
+  if (results.length === 0) results.push({ langCode: "en", text: raw });
+  return results;
+}
+// Serialise descriptions array back to wikitext
+function serializeMultilangDesc(primary, extras) {
+  const all = [{ langCode: "en", text: primary }, ...(extras || [])].filter(d => d.text && d.text.trim());
+  if (all.length === 0) return "";
+  if (all.length === 1 && all[0].langCode === "en") return all[0].text;
+  return all.map(d => "{{" + d.langCode + "|1=" + d.text + "}}").join("");
+}
+// Strip metadata bullet-list embedded in a legacy description
+// Returns { cleanDesc, meta } where meta is an object of parsed fields
+function stripLegacyMetaFromDesc(text) {
+  if (!text) return { cleanDesc: text, meta: {} };
+  const lines = text.split(/\r?\n/);
+  const descLines = []; const metaLines = []; let inMeta = false;
+  for (const line of lines) {
+    const t = line.trim();
+    if (/^;\s*metadata\s*:?\s*$/i.test(t) || /^metadata\s*:?\s*$/i.test(t)) { inMeta = true; continue; }
+    if (inMeta && /^[*;]\s*.+:\s*.+/.test(t)) { metaLines.push(t.replace(/^[*;]\s*/, "")); }
+    else { if (inMeta && !t) continue; inMeta = false; descLines.push(line); }
+  }
+  const meta = {};
+  for (const ml of metaLines) {
+    const m = ml.match(/^([^:]+?)\s*:\s*(.+)/);
+    if (m) meta[m[1].trim().toLowerCase().replace(/\s+/g, "")] = m[2].trim();
+  }
+  return { cleanDesc: descLines.join("\n").trim(), meta };
+}
 // ============================================================
 // EXPORTERS
 // ============================================================
@@ -739,7 +919,7 @@ function exportToWikicode(record) {
   const subtitlesField = formatSubtitles(record);
 
   const osParams = [
-    `|description=${record.description}`,
+    `|description=${serializeMultilangDesc(record.description, record.extraDescriptions)}`,
     `|Project_name=${record.projectName}`,
     record.cast ? `|cast=${record.cast}` : null,
     `|Location=${record.recordingPlace}`,
@@ -785,7 +965,7 @@ function exportToWikicode(record) {
 
   const p3Table = `{| class="wikitable"\n|-\n! Field !! Value\n|-\n| Subtitles available || ${record.subtitlePageUrl ? "Yes" : "No"}\n|-\n| Subtitle details || ${subtitlesField}\n|-\n| Transcript available || ${oh.transcriptAvailable ? "Yes" : "No"}\n|-\n| Transcript details || ${transcriptDetails}\n|-\n| Transcript language(s) || ${oh.transcriptLanguages}\n|}`;
 
-  const ohSection = `== OpenSpeaks Oral History Documentation Record ==\n\n=== Parameter 1: Provenance and consent (${record.framework_p1 ? "yes" : "no"}) ===\n\n${p1Table}\n\n=== Parameter 2: Community review (${record.framework_p2 ? "yes" : "no"}) ===\n\n${p2Table}\n\n=== Parameter 3: Multilingual transcription / subtitles (${record.framework_p3 ? "yes" : "no"}) ===\n\n${p3Table}`;
+  const ohSection = `== OpenSpeaks Oral Knowledge Documentation Record ==\n\n=== Parameter 1: Provenance and consent (${record.framework_p1 ? "yes" : "no"}) ===\n\n${p1Table}\n\n=== Parameter 2: Community review (${record.framework_p2 ? "yes" : "no"}) ===\n\n${p2Table}\n\n=== Parameter 3: Multilingual transcription / subtitles (${record.framework_p3 ? "yes" : "no"}) ===\n\n${p3Table}`;
 
   const licenseSection = `=={{int:license-header}}==\n{{self|${record.license}}}`;
   const catLines = (record.categories || "").split(/[\n,]/).map(c => c.trim()).filter(Boolean).map(c => `[[Category:${c}]]`).join("\n");
@@ -1009,10 +1189,261 @@ function PreviewBox({ label, content }) {
 // ============================================================
 // MAIN APP
 // ============================================================
+
+// ============================================================
+// WEB-META FIELD SCHEMA  (based on web-metadata-fields.md)
+// Maps scraped/AI-extracted JSON into OpenSpeaks record fields
+// ============================================================
+
+function normLicense(raw) {
+  if (!raw) return "";
+  const r = raw.toLowerCase();
+  if (r.includes("by-sa 4") || r.includes("cc-by-sa-4") || r.includes("by-sa-4")) return "cc-by-sa-4.0";
+  if (r.includes("by-sa 3") || r.includes("cc-by-sa-3")) return "cc-by-sa-3.0";
+  if (r.includes("by-sa 2") || r.includes("cc-by-sa-2")) return "cc-by-sa-2.0";
+  if (r.includes("by 4.0") || r.includes("cc-by-4") || r.includes("cc by 4")) return "cc-by-4.0";
+  if (r.includes("by 3.0") || r.includes("cc-by-3")) return "cc-by-3.0";
+  if (r.includes("by 2.0") || r.includes("cc-by-2")) return "cc-by-2.0";
+  if (r.includes("cc0") || r.includes("public domain") || r.includes("cc-zero")) return "cc-zero";
+  if (r.includes("all rights reserved")) return "All rights reserved";
+  return raw;
+}
+
+function arr(v) { return Array.isArray(v) ? v : (v ? [v] : []); }
+
+function normWebMeta(meta) {
+  if (!meta || typeof meta !== "object") return null;
+  const r = {};
+  const s = (v) => (v || "").toString().trim();
+  const join = (v, sep) => arr(v).filter(Boolean).join(sep || ", ");
+
+  if (meta.title) r.title = s(meta.title);
+  if (meta.originalTitle || meta.original_title) r.originalTitle = s(meta.originalTitle || meta.original_title);
+  if (meta.year) r.year = s(meta.year);
+
+  // description — may be array or string
+  const desc = meta.description || meta.synopsis || meta.summary || "";
+  if (desc) r.description = Array.isArray(desc) ? desc.join("\n\n") : s(desc);
+
+  // languages — may be [{name, iso639}] or string
+  if (meta.languages && Array.isArray(meta.languages) && meta.languages.length) {
+    const first = meta.languages[0];
+    r.language = s(first.name || first);
+    if (first.iso639) r.languageISO = s(first.iso639);
+  } else if (meta.language) {
+    const isoD = extractISO639(s(meta.language));
+    if (isoD) { r.language = isoD.language; r.languageISO = isoD.languageISO; }
+    else r.language = s(meta.language);
+  }
+  if (meta.languageISO) r.languageISO = s(meta.languageISO);
+
+  if (meta.duration || meta.runtime) r.duration = s(meta.duration || meta.runtime);
+  if (meta.color) r.color = s(meta.color);
+  if (meta.sound) r.sound = s(meta.sound);
+  if (meta.genre) r.genre = s(meta.genre);
+
+  const topic = meta.topic || meta.topics || meta.topic_keywords || meta.subject || meta.keywords;
+  if (topic) r.topic = join(topic, "; ");
+
+  if (meta.cast) r.cast = join(meta.cast);
+  if (meta.director || meta.directors) r.director = join(meta.director || meta.directors);
+  if (meta.producer || meta.producers) r.producer = join(meta.producer || meta.producers);
+  if (meta.writer || meta.writers) r.writer = join(meta.writer || meta.writers);
+  if (meta.cinematographer || meta.camera) r.cinematographer = join(meta.cinematographer || meta.camera);
+  if (meta.editor || meta.editors) r.editor = join(meta.editor || meta.editors);
+  if (meta.recordist) r.recordist = join(meta.recordist);
+  if (meta.creator || meta.creators) {
+    // If no director/producer, map creator to producer
+    if (!r.producer) r.producer = join(meta.creator || meta.creators);
+  }
+
+  const pub = meta.releaseDate || meta.publicationDate || meta.publication_date || meta.date || "";
+  if (pub) r.releaseDate = s(pub);
+  const rec = meta.recordingDate || meta.recording_date || "";
+  if (rec) r.date = s(rec);
+
+  if (meta.projectName || meta.project_name || meta.collection) r.projectName = s(meta.projectName || meta.project_name || meta.collection);
+  if (meta.recordingPlace || meta.recording_place || meta.location) r.recordingPlace = s(meta.recordingPlace || meta.recording_place || meta.location);
+  if (meta.country) r.country = s(meta.country);
+
+  const sc = meta.subtitleCreators || meta.translation_credits || meta.subtitledBy;
+  if (sc) r.subtitleCreators = join(sc);
+  if (meta.subtitleLanguage) r.subtitleLanguage = s(meta.subtitleLanguage);
+
+  const copy = meta.copyrightHolder || meta.copyright || meta.rights_holder || "";
+  if (copy) r.copyrightHolder = s(copy);
+
+  const lic = meta.license || meta.licenseurl || meta.license_name || meta.license_uri || "";
+  if (lic) r.license = normLicense(s(lic));
+
+  if (meta.imdb) r.imdb = s(meta.imdb);
+  if (meta.doi || meta.eidr) r.doi = s(meta.doi || meta.eidr);
+
+  const cats = meta.categories || meta.category || meta.tags || [];
+  if (cats && arr(cats).length) r.categories = join(cats, "\n");
+
+  return Object.keys(r).length > 0 ? r : null;
+}
+
+// ── Archive.org: uses their public metadata JSON API ─────────────────────────
+async function fetchArchiveOrgMeta(url) {
+  const m = url.match(/archive\.org\/(?:details|embed)\/([^/?#\s]+)/);
+  if (!m) throw new Error("Could not read the Archive.org identifier from the URL. Example: archive.org/details/IDENTIFIER");
+  const id = m[1];
+  const apiUrl = "https://archive.org/metadata/" + id;
+  const res = await fetch(apiUrl, { mode: "cors" });
+  if (!res.ok) throw new Error("Archive.org API returned error " + res.status);
+  const json = await res.json();
+  const meta = json.metadata || {};
+  return normWebMeta({
+    title: meta.title,
+    description: meta.description,
+    year: meta.year || (meta.date || "").slice(0, 4),
+    language: Array.isArray(meta.language) ? meta.language[0] : meta.language,
+    duration: meta.runtime,
+    color: meta.color,
+    sound: meta.sound,
+    genre: meta.mediatype,
+    topic: meta.subject,
+    director: meta.director,
+    creator: meta.creator,
+    producer: meta.producer,
+    releaseDate: meta.date,
+    collection: Array.isArray(meta.collection) ? meta.collection.filter(x => x !== "opensource").join(", ") : meta.collection,
+    copyrightHolder: meta.credits,
+    license: meta.licenseurl || meta.rights,
+    imdb: (meta.identifier_arc || meta.external_identifier || []).find ? 
+      (arr(meta.external_identifier || []).find(x => /imdb/i.test(x)) || "").replace(/.*\/title\/(tt\d+).*/i, "$1") : "",
+  });
+}
+
+// ── Wikidata: uses the entity JSON API ────────────────────────────────────────
+async function fetchWikidataMeta(url) {
+  const m = url.match(/wikidata\.org\/wiki\/(Q\d+)/i) || url.match(/^(Q\d+)$/i);
+  if (!m) throw new Error("Could not read a Wikidata Q-number from the URL. Example: https://www.wikidata.org/wiki/Q12345");
+  const qid = m[1];
+  const apiUrl = "https://www.wikidata.org/w/api.php?action=wbgetentities&ids=" + qid + "&format=json&origin=*";
+  const res = await fetch(apiUrl);
+  if (!res.ok) throw new Error("Wikidata API returned error " + res.status);
+  const json = await res.json();
+  const entity = (json.entities || {})[qid];
+  if (!entity) throw new Error("No Wikidata entity found for " + qid);
+
+  const label = (entity.labels?.en?.value) || (Object.values(entity.labels || {})[0]?.value) || "";
+  const desc = (entity.descriptions?.en?.value) || "";
+
+  // Extract common claims. P57=director, P136=genre, P364=orig lang, P577=pub date, P2047=duration
+  const claims = entity.claims || {};
+  function claimStr(prop) {
+    const cs = claims[prop];
+    if (!cs || !cs.length) return "";
+    const v = cs[0]?.mainsnak?.datavalue?.value;
+    if (!v) return "";
+    if (typeof v === "string") return v;
+    if (v.time) return v.time.replace(/^\+/, "").slice(0, 10);
+    if (v.amount) return v.amount.replace(/^\+/, "");
+    if (v.id) return v.id; // Q-number for entity references
+    return "";
+  }
+  function claimLabels(prop, lang) {
+    const cs = claims[prop];
+    if (!cs) return [];
+    return cs.slice(0, 5).map(x => {
+      const id = x?.mainsnak?.datavalue?.value?.id;
+      if (!id) return "";
+      // Return Qid as fallback — caller can resolve if needed
+      return id;
+    }).filter(Boolean);
+  }
+
+  return normWebMeta({
+    title: label,
+    description: desc,
+    releaseDate: claimStr("P577"),
+    duration: claimStr("P2047"),
+    // For entities, qids won't resolve to names here but are preserved
+  });
+}
+
+// ── AI-powered extraction via Anthropic API + web_search ─────────────────────
+async function fetchWithClaude(url, siteName) {
+  const systemPrompt = "You are a metadata extraction assistant for a language archive tool. Use web_search to visit the URL and extract all available metadata. Return ONLY a valid JSON object. No markdown fences, no explanation, no preamble.";
+  const userPrompt = `Visit this ${siteName} page and extract all metadata: ${url}
+
+Return a JSON object with these fields (include only fields you found; omit absent ones):
+{
+  "title": "",
+  "originalTitle": "",
+  "year": "",
+  "description": "main synopsis or description text",
+  "language": "name of the main spoken language",
+  "languageISO": "ISO 639-1/2/3 code",
+  "duration": "e.g. 10:30 or 45 min",
+  "color": "Color or Black and White",
+  "sound": "Stereo, Mono, or Silent",
+  "genre": "",
+  "topic": ["array of topics or keywords"],
+  "cast": ["array of performer or speaker names"],
+  "director": ["array"],
+  "producer": ["array"],
+  "writer": ["array"],
+  "cinematographer": ["array"],
+  "editor": ["array"],
+  "recordist": ["array"],
+  "releaseDate": "YYYY-MM-DD",
+  "date": "YYYY-MM-DD recording date",
+  "projectName": "project or collection name",
+  "recordingPlace": "city, district, country",
+  "subtitleCreators": ["names of subtitle/translation contributors"],
+  "subtitleLanguage": "",
+  "copyrightHolder": "",
+  "license": "e.g. CC BY-SA 4.0",
+  "imdb": "tt1234567",
+  "categories": ["array"],
+  "country": ""
+}`;
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      system: systemPrompt,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      messages: [{ role: "user", content: userPrompt }],
+    })
+  });
+
+  const data = await response.json();
+  if (data.error) throw new Error(data.error.message || "Anthropic API error");
+
+  const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
+  const clean = text.replace(/```json|```/g, "").trim();
+  const jStart = clean.indexOf("{");
+  const jEnd = clean.lastIndexOf("}");
+  if (jStart === -1) throw new Error("AI could not extract metadata from this page. Try pasting the page text below instead.");
+  const meta = JSON.parse(clean.slice(jStart, jEnd + 1));
+  return normWebMeta(meta);
+}
+
+// ── Main URL dispatcher ───────────────────────────────────────────────────────
+function detectSite(url) {
+  if (/commons\.wikimedia\.org/i.test(url)) return "commons";
+  if (/archive\.org/i.test(url)) return "archive.org";
+  if (/wikidata\.org/i.test(url)) return "wikidata";
+  if (/pad\.ma/i.test(url)) return "pad.ma";
+  if (/indiancine\.ma/i.test(url)) return "indiancine.ma";
+  if (/elararchive\.org/i.test(url)) return "elar";
+  return "other";
+}
+
 function App() {
   const [record, setRecord] = useState(defaultRecord);
-  const [activeTab, setActiveTab] = useState("basic");
+  const [activeTab, setActiveTab] = useState("import");
   const [pasteInput, setPasteInput] = useState("");
+  const [commonsUrl, setCommonsUrl] = useState("");
+  const [fetchingCommons, setFetchingCommons] = useState(false);
   const [parseMsg, setParseMsg] = useState({ type: "", text: "" });
   const [exportFmt, setExportFmt] = useState("wikicode");
   const [copied, setCopied] = useState(false);
@@ -1037,6 +1468,54 @@ function App() {
     const { result: parsed, format } = parseAnyInput(pasteInput);
     applyParsed(parsed, format);
   };
+
+  const fetchFromUrl = async () => {
+    const url = commonsUrl.trim();
+    if (!url) return;
+    setFetchingCommons(true); setParseMsg({});
+    const site = detectSite(url);
+    try {
+      if (site === "commons") {
+        let title = url;
+        const wikiMatch = title.match(/\/wiki\/([^?#]+)/);
+        if (wikiMatch) title = decodeURIComponent(wikiMatch[1].replace(/_/g, " "));
+        if (!title.startsWith("File:")) title = "File:" + title;
+        const apiUrl = "https://commons.wikimedia.org/w/api.php?action=parse&page=" + encodeURIComponent(title) + "&prop=wikitext&format=json&origin=*";
+        const res = await fetch(apiUrl);
+        const json = await res.json();
+        if (json.error) throw new Error(json.error.info || "API error");
+        const wikitext = (json.parse && json.parse.wikitext && json.parse.wikitext["*"]) || "";
+        if (!wikitext) throw new Error("No content found. Check the URL.");
+        setPasteInput(wikitext);
+        const parsed = parseWikitextIntoRecord(wikitext);
+        applyParsed(parsed, "Commons page \"" + title + "\"");
+
+      } else if (site === "archive.org") {
+        const meta = await fetchArchiveOrgMeta(url);
+        applyParsed(meta, "Internet Archive page");
+
+      } else if (site === "wikidata") {
+        const meta = await fetchWikidataMeta(url);
+        applyParsed(meta, "Wikidata entity");
+
+      } else {
+        // pad.ma, indiancine.ma, ELAR, or unknown — AI-assisted
+        const siteName = site === "other" ? (new URL(url).hostname) : site;
+        setParseMsg({ type: "info", text: "Using AI to read " + siteName + "… this may take a few seconds." });
+        const meta = await fetchWithClaude(url, siteName);
+        applyParsed(meta, siteName + " page");
+      }
+    } catch (err) {
+      const isCors = err instanceof TypeError && err.message.toLowerCase().includes("fetch");
+      setParseMsg({ type: "error", text: isCors
+        ? "Could not reach the page (the site does not allow external access). Try copying the page text and pasting it in the box below."
+        : "Could not fetch: " + err.message });
+    } finally {
+      setFetchingCommons(false);
+    }
+  };
+  // keep old name as alias so UI references still work
+  const fetchFromCommons = fetchFromUrl;
 
   const handleFileImport = (e, adapter, label) => {
     const file = e.target.files[0];
@@ -1069,12 +1548,12 @@ function App() {
   const resetForm = () => { setRecord(defaultRecord); setClearMsg("Form cleared."); setTimeout(() => setClearMsg(""), 2500); };
 
   const TABS = [
+    { id: "import", icon: "📥", label: "Import" },
     { id: "basic", icon: "📄", label: "Basic Info" },
     { id: "production", icon: "🎬", label: "Production" },
     { id: "people", icon: "👥", label: "People" },
     { id: "subtitles", icon: "📝", label: "Subtitles & OH" },
     { id: "license", icon: "🏷️", label: "License" },
-    { id: "import", icon: "📥", label: "Import" },
     { id: "export", icon: "📤", label: "Preview & Export" },
   ];
 
@@ -1147,34 +1626,59 @@ function App() {
         {/* ─── BASIC INFO ─── */}
         {activeTab === "basic" && (
           <div>
-            <SectionTitle title="Basic Information" sub="Core metadata for the recording" />
+            <SectionTitle title="Basic Information" sub="Fill in the main details about the file" />
             <div style={G2}>
-              <Field label="File Name"><FInput value={record.fileName} onChange={v => updateField("fileName", v)} placeholder="juray001.mp4" /></Field>
+              <Field label="File Name"><FInput value={record.fileName} onChange={v => updateField("fileName", v)} placeholder="example: juray001.mp4" /></Field>
               <Field label="File Type">
                 <FSelect value={record.fileType} onChange={v => updateField("fileType", v)}
                   options={[{value:"video",label:"Video"},{value:"audio",label:"Audio"},{value:"image",label:"Image"},{value:"document",label:"Document"}]} />
               </Field>
             </div>
-            <Field label="Title" help="Supports multilingual titles: 'Juray language documentation / जुराय भाषा दस्तावेज़ीकरण'">
+            <Field label="Title" help="Main title of the file. You can write it in more than one language, separated by / or |">
               <FInput value={record.title} onChange={v => updateField("title", v)} placeholder="Juray language documentation / जुराय भाषा दस्तावेज़ीकरण" />
             </Field>
-            <Field label="Title in native/other language"><FInput value={record.originalTitle} onChange={v => updateField("originalTitle", v)} placeholder="Title in native script (optional)" /></Field>
-            <Field label="File description" help="">
-              <FTextarea value={record.description} onChange={v => updateField("description", v)} rows={5} placeholder="Describe the session, its context, and why it matters for language documentation..." />
+            <Field label="Title in native/other language"><FInput value={record.originalTitle} onChange={v => updateField("originalTitle", v)} placeholder="Title in original language or script (optional)" /></Field>
+            <Field label="File description" help="Write a description in English. You can add descriptions in other languages below.">
+              <FTextarea value={record.description} onChange={v => updateField("description", v)} rows={5} placeholder="Describe the session, its context, and why it is important. Example: In this video, Dinabandhu Gamango talks about..." />
+              {/* Extra-language descriptions */}
+              {(record.extraDescriptions || []).map((ed, idx) => (
+                <div key={idx} style={{ marginTop: "0.75rem", display: "flex", gap: "0.5rem", alignItems: "flex-start" }}>
+                  <select value={ed.langCode} onChange={e => {
+                    const next = [...(record.extraDescriptions || [])];
+                    next[idx] = { ...next[idx], langCode: e.target.value };
+                    updateField("extraDescriptions", next);
+                  }} style={{ padding: "0.4rem 0.5rem", borderRadius: "6px", border: "1.5px solid var(--border)", background: "var(--surface)", color: "var(--text)", fontSize: "0.78rem", minWidth: "9rem", flexShrink: 0 }}>
+                    {LANG_CODES.map(l => <option key={l.code} value={l.code}>{l.code} — {l.name}</option>)}
+                  </select>
+                  <FTextarea value={ed.text} onChange={v => {
+                    const next = [...(record.extraDescriptions || [])];
+                    next[idx] = { ...next[idx], text: v };
+                    updateField("extraDescriptions", next);
+                  }} rows={3} placeholder={`Description in ${langName(ed.langCode)}...`} style={{ flex: 1 }} />
+                  <button onClick={() => {
+                    const next = (record.extraDescriptions || []).filter((_, i) => i !== idx);
+                    updateField("extraDescriptions", next);
+                  }} title="Remove" style={{ background: "none", border: "none", color: "var(--muted)", cursor: "pointer", fontSize: "1.1rem", lineHeight: 1, paddingTop: "0.4rem" }}>✕</button>
+                </div>
+              ))}
+              <button className="btn-sec" style={{ marginTop: "0.6rem", fontSize: "0.75rem" }} onClick={() => {
+                const next = [...(record.extraDescriptions || []), { langCode: "hi", text: "" }];
+                updateField("extraDescriptions", next);
+              }}>+ Add description in another language</button>
             </Field>
             <div style={G2}>
-              <Field label="Language" help="For dialects, in Dialect-Language format">
+              <Field label="Language" help="Name of the language spoken in the recording. For a dialect, write it as Dialect–Language, e.g. Marchha-Rongpo">
                 <FInput value={record.language} onChange={v => updateField("language", v)} placeholder="Marchha-Rongpo" />
               </Field>
-              <Field label="Language ISO 639-3"><FInput value={record.languageISO} onChange={v => updateField("languageISO", v)} placeholder="juy" /></Field>
+              <Field label={<span>Language ISO 639 code <a href="https://iso639-3.sil.org/code_tables/639/data" target="_blank" rel="noreferrer" style={{ fontSize: "0.7rem", color: "var(--accent2)", textDecoration: "none", fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>more ↗</a></span>}><FInput value={record.languageISO} onChange={v => updateField("languageISO", v)} placeholder="juy" /></Field>
             </div>
             <div style={G2}>
               <Field label="Country"><FInput value={record.country} onChange={v => updateField("country", v)} placeholder="India" /></Field>
               <Field label="Recording Location"><FInput value={record.recordingPlace} onChange={v => updateField("recordingPlace", v)} placeholder="Village/City, Province/State" /></Field>
             </div>
             <div style={G3}>
-              <Field label="Recording Date" help="YYYY-MM-DD"><FInput value={record.releaseDate} onChange={v => updateField("releaseDate", v)} placeholder="2026-04-16" /></Field>
-              <Field label="Publication Date" help="YYYY-MM-DD"><FInput value={record.date} onChange={v => updateField("date", v)} placeholder="2026-04-07" /></Field>
+              <Field label="Recording Date" help="When was it recorded? Use format YYYY-MM-DD"><FInput value={record.releaseDate} onChange={v => updateField("releaseDate", v)} placeholder="2026-04-16" /></Field>
+              <Field label="Publication Date" help="When was it published or uploaded? Use format YYYY-MM-DD"><FInput value={record.date} onChange={v => updateField("date", v)} placeholder="2026-04-07" /></Field>
               <Field label="Duration / Runtime"><FInput value={record.duration} onChange={v => updateField("duration", v)} placeholder="2:25 min" /></Field>
             </div>
             <div style={G3}>
@@ -1276,7 +1780,7 @@ function App() {
         {/* ─── SUBTITLES & ORAL HISTORY ─── */}
         {activeTab === "subtitles" && (
           <div>
-            <SectionTitle title="Subtitles & Oral History" sub="Subtitle generation and consent / community review framework" />
+            <SectionTitle title="Subtitles & Oral Knowledge" sub="Subtitle details and consent / community review framework" />
             <PreviewBox label="Live preview — generated |Subtitles= field" content={formatSubtitles(record)} />
 
             <div style={{ fontFamily: "var(--font-display)", fontSize: "1.1rem", color: "var(--text2)", marginBottom: "1rem", fontStyle: "italic" }}>Subtitle Details</div>
@@ -1357,7 +1861,7 @@ function App() {
             <Field label="License">
               <FSelect value={record.license} onChange={v => updateField("license", v)}
                 options={[
-                  {value:"cc-by-sa-4.0",label:"CC BY-SA 4.0 (recommended for oral history)"},
+                  {value:"cc-by-sa-4.0",label:"CC BY-SA 4.0 (recommended for oral knowledge)"},
                   {value:"cc-by-4.0",label:"CC BY 4.0"},
                   {value:"cc-zero",label:"CC0 (Public Domain Dedication)"},
                   {value:"cc-by-sa-3.0",label:"CC BY-SA 3.0"},
@@ -1376,7 +1880,7 @@ function App() {
 
             <Field label="Categories" help="One category per line (or comma-separated). Do not include [[Category: ]] brackets.">
               <FTextarea value={record.categories} onChange={v => updateField("categories", v)} rows={12}
-                placeholder={"Juray language\nDinabandhu Gamango\nOpino Gomango\nOral history\nFiles uploaded from OpenSpeaks Archives in 2026\nMedia related to WMF grant ID G-GS-2502-18088"} />
+                placeholder={"Juray language\nDinabandhu Gamango\nOpino Gomango\nOral knowledge\nFiles uploaded from OpenSpeaks Archives in 2026\nMedia related to WMF grant ID G-GS-2502-18088"} />
             </Field>
           </div>
         )}
@@ -1384,7 +1888,7 @@ function App() {
         {/* ─── IMPORT ─── */}
         {activeTab === "import" && (
           <div>
-            <SectionTitle title="Import" sub="Populate the form from a file, pasted wikitext, or plain-text metadata" />
+            <SectionTitle title="Import" sub="Bring in metadata from a URL, a file, or by pasting text" />
 
             {parseMsg.type === "error" && (
               <div style={{ background: "#fef2f2", border: "1px solid #fca5a5", borderRadius: "8px", padding: ".75rem 1rem", marginBottom: "1.5rem", color: "var(--error)", fontSize: ".85rem" }}>⚠️ {parseMsg.text}</div>
@@ -1408,64 +1912,105 @@ function App() {
               ))}
             </div>
 
-            <div style={{ borderTop: "1px solid var(--border)", paddingTop: "1.75rem" }}>
-              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.2rem", color: "var(--text2)", marginBottom: "0.4rem", fontStyle: "italic" }}>Paste Wikitext or Plain-Text Metadata</div>
+            <div style={{ borderTop: "1px solid var(--border)", paddingTop: "1.75rem", marginBottom: "2rem" }}>
+              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.2rem", color: "var(--text2)", marginBottom: "0.35rem", fontStyle: "italic" }}>Fetch metadata from a URL</div>
+              <p style={{ fontSize: "0.78rem", color: "var(--muted)", margin: "0 0 0.75rem 0", lineHeight: 1.6 }}>
+                Paste a URL and click <strong>Fetch metadata</strong>. The tool reads the page and fills the form automatically.
+              </p>
+
+              {/* Site chips */}
+              <div style={{ display: "flex", gap: "0.45rem", flexWrap: "wrap", marginBottom: "0.9rem" }}>
+                {[
+                  { name: "Wikimedia Commons", color: "#3B84D0", example: "https://commons.wikimedia.org/wiki/File:OpenSpeaks-juy-Juray-Dinabandhu_Gamango-OG-Social_Impact_of_Aadhaar.webm", note: "Direct API" },
+                  { name: "Internet Archive", color: "#4A6FA5", example: "https://archive.org/details/IDENTIFIER", note: "Direct API" },
+                  { name: "Wikidata", color: "#990000", example: "https://www.wikidata.org/wiki/Q12345", note: "Direct API" },
+                  { name: "Pad.ma", color: "#5C6BC0", example: "https://pad.ma/IDENTIFIER", note: "AI-assisted" },
+                  { name: "Indiancine.ma", color: "#2E7D32", example: "https://indiancine.ma/CWEZ/info", note: "AI-assisted" },
+                  { name: "ELAR", color: "#6A4C93", example: "https://www.elararchive.org/dk0848", note: "AI-assisted" },
+                ].map(site => (
+                  <button key={site.name} onClick={() => setCommonsUrl(site.example)}
+                    title={"Click to fill example URL — " + site.note}
+                    style={{ display: "inline-flex", alignItems: "center", gap: "0.3rem", padding: "0.28rem 0.65rem", borderRadius: "999px", border: "1.5px solid " + site.color, background: "transparent", color: site.color, fontSize: "0.72rem", fontWeight: 600, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+                    {site.name}
+                    <span style={{ fontSize: "0.62rem", opacity: 0.75, fontWeight: 400 }}>({site.note})</span>
+                  </button>
+                ))}
+              </div>
+
+              <p style={{ fontSize: "0.72rem", color: "var(--muted)", margin: "0 0 0.75rem 0", lineHeight: 1.5 }}>
+                <strong>Direct API</strong> — fetches data directly from the site's public API (fast, reliable).{" "}
+                <strong>AI-assisted</strong> — uses AI to read the page and extract metadata (a few seconds; requires internet access).
+              </p>
+
+              <div style={{ display: "flex", gap: "0.65rem", alignItems: "center", flexWrap: "wrap" }}>
+                <input
+                  type="url"
+                  value={commonsUrl}
+                  onChange={e => setCommonsUrl(e.target.value)}
+                  placeholder="Paste a URL or click a site button above…"
+                  style={{ flex: "1 1 320px", padding: "0.5rem 0.65rem", borderRadius: "6px", border: "1.5px solid var(--border)", background: "var(--surface)", color: "var(--text)", fontSize: "0.82rem", fontFamily: "inherit" }}
+                  onKeyDown={e => { if (e.key === "Enter") fetchFromUrl(); }}
+                />
+                <button className="btn-primary" onClick={fetchFromUrl} disabled={fetchingCommons} style={{ whiteSpace: "nowrap", opacity: fetchingCommons ? 0.7 : 1 }}>
+                  {fetchingCommons ? "⏳ Fetching…" : "⬇ Fetch metadata"}
+                </button>
+                <button className="btn-sec" onClick={() => { setCommonsUrl(""); setParseMsg({}); }} style={{ whiteSpace: "nowrap" }}>Clear</button>
+              </div>
+            </div>
+
+                        <div style={{ borderTop: "1px solid var(--border)", paddingTop: "1.75rem" }}>
+              <div style={{ fontFamily: "var(--font-display)", fontSize: "1.2rem", color: "var(--text2)", marginBottom: "0.4rem", fontStyle: "italic" }}>Paste text or upload a file</div>
               <p style={{ fontSize: "0.78rem", color: "var(--muted)", margin: "0 0 0.6rem 0", lineHeight: 1.6 }}>
-                Paste text from <strong>any</strong> of these sources — the tool auto-detects the format and fills the form:
+                Paste text from any source — the tool detects the format and fills the form automatically. You can also upload a file.
               </p>
               <ul style={{ fontSize: "0.76rem", color: "var(--muted)", margin: "0 0 1rem 1.25rem", padding: 0, lineHeight: 1.9 }}>
-                <li><strong>Commons wikitext</strong> — a full file-description page with <code>{"{{Information}}"}</code> and/or <code>{"{{OpenSpeaks}}"}</code></li>
-                <li><strong>Plain-text metadata</strong> — fields separated by colons, tabs, or spaces (e.g. <code>Language: Juray</code>), including exports from spreadsheets or notes</li>
-                <li><strong>.txt or .docx file</strong> — upload using the buttons below; text is extracted and parsed automatically</li>
+                <li><strong>Wikimedia Commons wikitext</strong> — a full file page with <code>{"{{Information}}"}</code> and/or <code>{"{{OpenSpeaks}}"}</code></li>
+                <li><strong>Plain-text or spreadsheet notes</strong> — lines like <code>Language: Juray (ISO 639: juy)</code> or <code>Cast: Name</code> work fine</li>
+                <li><strong>.txt or .docx file</strong> — use the upload button below; the text is read and parsed for you</li>
               </ul>
-              <div style={{ display: "flex", gap: "0.75rem", marginBottom: "1rem", flexWrap: "wrap" }}>
-                <label className="import-zone" style={{ flex: "1 1 160px", padding: "0.9rem 0.75rem", gap: "0.3rem" }}>
-                  <span style={{ fontSize: "1.5rem" }}>📄</span>
-                  <div style={{ fontWeight: 600, fontSize: "0.78rem", color: "var(--text2)" }}>Upload .txt file</div>
-                  <div style={{ fontSize: "0.68rem" }}>Plain-text metadata or wikitext</div>
-                  <input type="file" accept=".txt" style={{ display: "none" }} onChange={e => {
-                    const file = e.target.files[0]; if (!file) return;
-                    const reader = new FileReader();
-                    reader.onload = ev => {
-                      const text = ev.target.result;
-                      setPasteInput(text);
-                      const { result: parsed, format } = parseAnyInput(text);
-                      applyParsed(parsed, `plain-text file "${file.name}"`);
-                    };
-                    reader.readAsText(file); e.target.value = "";
-                  }} />
-                </label>
-                <label className="import-zone" style={{ flex: "1 1 160px", padding: "0.9rem 0.75rem", gap: "0.3rem" }}>
-                  <span style={{ fontSize: "1.5rem" }}>📝</span>
-                  <div style={{ fontWeight: 600, fontSize: "0.78rem", color: "var(--text2)" }}>Upload .docx file</div>
-                  <div style={{ fontSize: "0.68rem" }}>Word document — text extracted via Mammoth</div>
-                  <input type="file" accept=".docx" style={{ display: "none" }} onChange={e => {
-                    const file = e.target.files[0]; if (!file) return;
+              <label className="import-zone" style={{ display: "flex", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: "0.65rem", padding: "0.85rem 1rem", marginBottom: "1rem" }}>
+                <span style={{ fontSize: "1.4rem" }}>📂</span>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: "0.8rem", color: "var(--text2)" }}>Upload a file (.txt or .docx)</div>
+                  <div style={{ fontSize: "0.68rem", color: "var(--muted)" }}>Plain text, wikitext, or Word document</div>
+                </div>
+                <input type="file" accept=".txt,.docx" style={{ display: "none" }} onChange={e => {
+                  const file = e.target.files[0]; if (!file) return;
+                  const isDOCX = file.name.toLowerCase().endsWith(".docx");
+                  if (isDOCX) {
                     if (typeof mammoth === "undefined") {
                       setParseMsg({ type: "error", text: "Mammoth library not loaded yet. Try refreshing the page." }); return;
                     }
                     const reader = new FileReader();
-                    reader.onload = ev2 => {
-                      mammoth.extractRawText({ arrayBuffer: ev2.target.result })
+                    reader.onload = ev => {
+                      mammoth.extractRawText({ arrayBuffer: ev.target.result })
                         .then(res2 => {
-                          const text = res2.value;
-                          setPasteInput(text);
+                          const text = res2.value; setPasteInput(text);
                           const { result: parsed, format } = parseAnyInput(text);
                           applyParsed(parsed, `Word document "${file.name}"`);
                         })
                         .catch(() => setParseMsg({ type: "error", text: `Could not extract text from "${file.name}". Ensure it is a valid .docx file.` }));
                     };
-                    reader.readAsArrayBuffer(file); e.target.value = "";
-                  }} />
-                </label>
-              </div>
+                    reader.readAsArrayBuffer(file);
+                  } else {
+                    const reader = new FileReader();
+                    reader.onload = ev => {
+                      const text = ev.target.result; setPasteInput(text);
+                      const { result: parsed, format } = parseAnyInput(text);
+                      applyParsed(parsed, `file "${file.name}"`);
+                    };
+                    reader.readAsText(file);
+                  }
+                  e.target.value = "";
+                }} />
+              </label>
               <FTextarea value={pasteInput} onChange={setPasteInput} rows={16}
                 placeholder={`Paste wikitext OR plain-text metadata here. Examples:\n\n── Commons wikitext ──────────────────────\n=={{int:filedesc}}==\n{{Information\n|description=\n{{OpenSpeaks\n|description=In this video...\n|Language=Juray (ISO 639: juy)\n|Location=Jholasahi, Gajapati district, Odisha, India\n|Runtime=2:25 min\n|Framework_p1=yes\n|Framework_p2=yes\n|Framework_p3=yes\n}}\n|date=2026-04-07\n|author=\n; Moral Rights: {{Wikidata|Q138978470}}\n; Copyright: [[User:SubhashishPanigrahi]]\n}}\n{{self|cc-by-sa-4.0}}\n[[Category:Juray language]]\n\n── Plain-text metadata ───────────────────\nProject/Film name: OpenSpeaks Archives\nCast: Dinabandhu Gamango\nLanguage: Juray (ISO 639: juy)\nRuntime: 2:25 min\nGenre: Documentary\nIMDb tt14546228\nProducer: Subhashish Panigrahi\nSubtitles: In English by Name1 (creator), Name2 (editor)`}
               />
               <div style={{ display: "flex", gap: "0.75rem", marginTop: "1rem", flexWrap: "wrap", alignItems: "center" }}>
                 <button className="btn-primary" onClick={handleParseWikitext}>⚡ Parse into form</button>
                 <button className="btn-sec" onClick={() => { setPasteInput(""); setParseMsg({}); }}>Clear</button>
-                <span style={{ fontSize: "0.7rem", color: "var(--muted)", marginLeft: "0.25rem" }}>Format is auto-detected: wikitext or plain-text.</span>
+                <span style={{ fontSize: "0.7rem", color: "var(--muted)", marginLeft: "0.25rem" }}>The format is detected automatically.</span>
               </div>
             </div>
           </div>
@@ -1474,7 +2019,7 @@ function App() {
         {/* ─── PREVIEW & EXPORT ─── */}
         {activeTab === "export" && (
           <div>
-            <SectionTitle title="Preview & Export" sub="Review the generated output and download in your chosen format" />
+            <SectionTitle title="Preview & Export" sub="Check the output and copy or download it" />
 
             <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1.25rem", flexWrap: "wrap", alignItems: "center" }}>
               {[
@@ -1493,7 +2038,7 @@ function App() {
             <pre style={{ fontFamily: "var(--font-mono)", fontSize: "0.7rem", lineHeight: 1.75, whiteSpace: "pre-wrap", wordBreak: "break-all", background: "#1a120b", color: "#f5e6d8", padding: "1.5rem", borderRadius: "10px", maxHeight: "55vh", overflowY: "auto", margin: "0 0 1.25rem 0" }}>{generatedOutput}</pre>
 
             <div style={{ background: "var(--surface2)", borderRadius: "8px", padding: "1rem 1.25rem", fontSize: "0.75rem", color: "var(--muted)", lineHeight: 1.6 }}>
-              <strong style={{ color: "var(--text2)" }}>Format notes:</strong> <strong>Wikicode</strong> generates the full Commons file description page with <code>{"{{Information}}"}</code>, nested <code>{"{{OpenSpeaks}}"}</code>, oral history tables (P1–P3), license, and categories. <code>|Copyright_holder=</code> is intentionally omitted from <code>{"{{OpenSpeaks}}"}</code> — copyright is surfaced in <code>|author=</code> instead. <strong>JSON</strong> uses the OpenSpeaks v1.2 schema and can be re-imported. <strong>Markdown</strong> and <strong>HTML</strong> are human-readable reference formats.
+              <strong style={{ color: "var(--text2)" }}>Format notes:</strong> <strong>Wikicode</strong> generates the full Commons file description page with <code>{"{{Information}}"}</code>, nested <code>{"{{OpenSpeaks}}"}</code>, oral knowledge tables (P1–P3), license, and categories. <code>|Copyright_holder=</code> is intentionally omitted from <code>{"{{OpenSpeaks}}"}</code> — copyright is surfaced in <code>|author=</code> instead. <strong>JSON</strong> uses the OpenSpeaks v1.2 schema and can be re-imported. <strong>Markdown</strong> and <strong>HTML</strong> are human-readable reference formats.
             </div>
           </div>
         )}
