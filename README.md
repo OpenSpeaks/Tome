@@ -1,6 +1,6 @@
-# OpenSpeaks Metadata Generator
+# OpenSpeaks Tome
 
-OpenSpeaks Metadata Generator is a browser-based tool for creating and editing metadata for audio, video, image, and document files. It helps you prepare Wikimedia Commons file pages, keep metadata in a reusable JSON format, and import or edit records from archive formats used by language documentation projects.
+OpenSpeaks Tome is a browser-based tool for creating and editing metadata for audio, video, image, and document files. It helps you prepare Wikimedia Commons file pages, keep metadata in a reusable JSON format, and import or edit records from archive formats used by language documentation projects.
 
 It is made for people who work with language documentation, oral history, and community archives.
 
@@ -410,4 +410,4 @@ This project is under the MIT License.
 
 ## Project link
 
-Current prototype: [OpenSpeaks Metadata Generator]([https://psubhashish.github.io/metadata-generator/](https://openspeaks.github.io/metadata-generator/))
+Current prototype: [OpenSpeaks Tome]([https://psubhashish.github.io/metadata-generator/](https://openspeaks.github.io/metadata-generator/))
