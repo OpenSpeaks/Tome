@@ -1734,7 +1734,7 @@ function App() {
             <PreviewBox label="Live preview — generated |author= field" content={formatAuthorField(record)} />
             <div style={G2}>
               <Field label="Author Username (Commons)" help="No 'User:' prefix. Goes into the Copyright line of |author=.">
-                <FInput value={record.authorUsername} onChange={v => updateField("authorUsername", v)} placeholder="SubhashishPanigrahi" />
+                <FInput value={record.authorUsername} onChange={v => updateField("authorUsername", v)} placeholder="First1 Last1" />
               </Field>
               <Field label="Copyright Holder" help="Fallback if no username. No longer emitted as |Copyright_holder= in {{OpenSpeaks}}.">
                 <FInput value={record.copyrightHolder} onChange={v => updateField("copyrightHolder", v)} placeholder="First1 Last1" />
