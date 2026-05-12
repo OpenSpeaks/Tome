@@ -412,7 +412,7 @@ function parsePlainTextToRecord(text) {
     const ohKey = OH_MAP[nk] || OH_MAP[key.toLowerCase().trim()];
     if (!ohKey) return;
     if (ohKey === "_speakers") {
-      // "Dinabandhu Gamango (male)" → parse into interviewees
+      // "First3 Last3 (male)" → parse into interviewees
       if (!result.interviewees) result.interviewees = [];
       value.split(",").forEach(s => {
         const m = s.trim().match(/^(.+?)\s*\((\w+)\)$/);
@@ -442,7 +442,7 @@ function parsePlainTextToRecord(text) {
   }
 
   function parseSubtitleString(res, val) {
-    // e.g. "In English by Name1 (creator), Name2 (reviewer), Subhashish Panigrahi (editor)"
+    // e.g. "In English by Name1 (creator), Name2 (reviewer), First1 Last1 (editor)"
     // e.g. "In [[TimedText:...|English]] by Name1, Name2; Name3 (editor)"
     const langM = val.match(/^In\s+(?:\[\[(?:TimedText:[^\|]*)\|)?([^\]]+)\]?\]?\s+by\s+/i);
     if (langM) res.subtitleLanguage = langM[1].trim();
@@ -496,7 +496,7 @@ function parsePlainTextToRecord(text) {
       else result.language = value;
       return true;
     }
-    // Strip parenthetical abbreviations e.g. "Subhashish Panigrahi (SP)"
+    // Strip parenthetical abbreviations e.g. "First1 Last1 (FL)"
     const cleanVal = value.replace(/\s*\(\w{1,3}\)\s*$/, "").trim();
     result[mapped] = cleanVal;
     return true;
@@ -1640,7 +1640,7 @@ function App() {
             </Field>
             <Field label="Title in native/other language"><FInput value={record.originalTitle} onChange={v => updateField("originalTitle", v)} placeholder="Title in original language or script (optional)" /></Field>
             <Field label="File description" help="Write a description in English. You can add descriptions in other languages below.">
-              <FTextarea value={record.description} onChange={v => updateField("description", v)} rows={5} placeholder="Describe the session, its context, and why it is important. Example: In this video, Dinabandhu Gamango talks about..." />
+              <FTextarea value={record.description} onChange={v => updateField("description", v)} rows={5} placeholder="Describe the session, its context, and why it is important. Example: In this video, First3 Last3 talks about..." />
               {/* Extra-language descriptions */}
               {(record.extraDescriptions || []).map((ed, idx) => (
                 <div key={idx} style={{ marginTop: "0.75rem", display: "flex", gap: "0.5rem", alignItems: "flex-start" }}>
@@ -1700,7 +1700,7 @@ function App() {
             <SectionTitle title="Production Details" sub="Crew, identifiers, and classification metadata" />
             <Field label="Project Name"><FInput value={record.projectName} onChange={v => updateField("projectName", v)} placeholder="OpenSpeaks Archives" /></Field>
             <div style={G2}>
-              <Field label="Cast / Featured Speaker(s)"><FInput value={record.cast} onChange={v => updateField("cast", v)} placeholder="Dinabandhu Gamango" /></Field>
+              <Field label="Cast / Featured Speaker(s)"><FInput value={record.cast} onChange={v => updateField("cast", v)} placeholder="First3 Last3" /></Field>
               <Field label="Genre"><FInput value={record.genre} onChange={v => updateField("genre", v)} placeholder="Interview" /></Field>
             </div>
             <Field label="Topic"><FInput value={record.topic} onChange={v => updateField("topic", v)} placeholder="Language documentation" /></Field>
@@ -1737,7 +1737,7 @@ function App() {
                 <FInput value={record.authorUsername} onChange={v => updateField("authorUsername", v)} placeholder="SubhashishPanigrahi" />
               </Field>
               <Field label="Copyright Holder" help="Fallback if no username. No longer emitted as |Copyright_holder= in {{OpenSpeaks}}.">
-                <FInput value={record.copyrightHolder} onChange={v => updateField("copyrightHolder", v)} placeholder="Subhashish Panigrahi" />
+                <FInput value={record.copyrightHolder} onChange={v => updateField("copyrightHolder", v)} placeholder="First1 Last1" />
               </Field>
             </div>
 
@@ -1760,7 +1760,7 @@ function App() {
                 <div key={idx} style={{ background: "var(--surface2)", border: "1.5px solid var(--border)", borderRadius: "8px", padding: "1rem", marginBottom: "0.75rem", position: "relative" }}>
                   <button onClick={() => removeIE(idx)} style={{ position: "absolute", top: "0.75rem", right: "0.75rem", background: "none", border: "none", cursor: "pointer", color: "var(--muted)", fontSize: "1.2rem", lineHeight: 1 }}>×</button>
                   <div style={G2}>
-                    <Field label={`Person ${idx + 1} — Full Name`}><FInput value={ie.fullName} onChange={v => updateIE(idx, "fullName", v)} placeholder="Dinabandhu Gamango" /></Field>
+                    <Field label={`Person ${idx + 1} — Full Name`}><FInput value={ie.fullName} onChange={v => updateIE(idx, "fullName", v)} placeholder="First3 Last3" /></Field>
                     <Field label="Wikidata QID" help="e.g. Q138978470 — unlocks {{Wikidata|QID}} in author field">
                       <FInput value={ie.wikidataQid} onChange={v => updateIE(idx, "wikidataQid", v)} placeholder="Q138978470" />
                     </Field>
@@ -1792,17 +1792,17 @@ function App() {
               </Field>
             </div>
             <Field label="Subtitle Creators" help="Comma-separated names of people who created the subtitles">
-              <FInput value={record.subtitleCreators} onChange={v => updateField("subtitleCreators", v)} placeholder="Kaliprasad Raji, Uday Raj Aaley" />
+              <FInput value={record.subtitleCreators} onChange={v => updateField("subtitleCreators", v)} placeholder="First6 Last6, First5 Last5" />
             </Field>
             <Field label="Editors / Reviewers" help="Use '/' to split editors from reviewers: 'Editor1, Editor2 / Reviewer1'. Without '/', first name = editor, second = reviewer.">
-              <FInput value={record.subtitleEditorsReviewers} onChange={v => updateField("subtitleEditorsReviewers", v)} placeholder="Subhashish Panigrahi / Opino Gomango" />
+              <FInput value={record.subtitleEditorsReviewers} onChange={v => updateField("subtitleEditorsReviewers", v)} placeholder="First1 Last1 / First2 Last2" />
             </Field>
 
             <div style={{ borderTop: "1px solid var(--border)", paddingTop: "1.5rem", marginTop: "1rem" }}>
               <div style={{ fontFamily: "var(--font-display)", fontSize: "1.1rem", color: "var(--text2)", marginBottom: "1rem", fontStyle: "italic" }}>Parameter 1: Provenance & Consent</div>
               <div style={G2}>
-                <Field label="Interviewer"><FInput value={record.oralHistory.interviewer} onChange={v => updateOH("interviewer", v)} placeholder="Opino Gomango" /></Field>
-                <Field label="Recorder / Camera Operator"><FInput value={record.oralHistory.recorder} onChange={v => updateOH("recorder", v)} placeholder="Subhashish Panigrahi" /></Field>
+                <Field label="Interviewer"><FInput value={record.oralHistory.interviewer} onChange={v => updateOH("interviewer", v)} placeholder="First2 Last2" /></Field>
+                <Field label="Recorder / Camera Operator"><FInput value={record.oralHistory.recorder} onChange={v => updateOH("recorder", v)} placeholder="First1 Last1" /></Field>
               </div>
               <div style={G2}>
                 <Field label="Recording Context">
@@ -1832,7 +1832,7 @@ function App() {
               </div>
               <div style={G2}>
                 <Field label="Review Date"><FInput value={record.oralHistory.communityReviewDate} onChange={v => updateOH("communityReviewDate", v)} placeholder="2026-05-07" /></Field>
-                <Field label="Reviewer(s)"><FInput value={record.oralHistory.communityReviewers} onChange={v => updateOH("communityReviewers", v)} placeholder="Opino Gomango" /></Field>
+                <Field label="Reviewer(s)"><FInput value={record.oralHistory.communityReviewers} onChange={v => updateOH("communityReviewers", v)} placeholder="First2 Last2" /></Field>
               </div>
               <Field label="Review Notes"><FTextarea value={record.oralHistory.communityReviewNotes} onChange={v => updateOH("communityReviewNotes", v)} rows={3} placeholder="Notes about the community review process..." /></Field>
             </div>
@@ -1881,7 +1881,7 @@ function App() {
 
             <Field label="Categories" help="One category per line (or comma-separated). Do not include [[Category: ]] brackets.">
               <FTextarea value={record.categories} onChange={v => updateField("categories", v)} rows={12}
-                placeholder={"Juray language\nDinabandhu Gamango\nOpino Gomango\nOral knowledge\nFiles uploaded from OpenSpeaks Archives in 2026\nMedia related to WMF grant ID G-GS-2502-18088"} />
+                placeholder={"Juray language\nFirst3 Last3\nFirst2 Last2\nOral knowledge\nFiles uploaded from OpenSpeaks Archives in 2026\nMedia related to WMF grant ID G-GS-2502-18088"} />
             </Field>
           </div>
         )}
@@ -2006,7 +2006,7 @@ function App() {
                 }} />
               </label>
               <FTextarea value={pasteInput} onChange={setPasteInput} rows={16}
-                placeholder={`Paste wikitext OR plain-text metadata here. Examples:\n\n── Commons wikitext ──────────────────────\n=={{int:filedesc}}==\n{{Information\n|description=\n{{OpenSpeaks\n|description=In this video...\n|Language=Juray (ISO 639: juy)\n|Location=Jholasahi, Gajapati district, Odisha, India\n|Runtime=2:25 min\n|Framework_p1=yes\n|Framework_p2=yes\n|Framework_p3=yes\n}}\n|date=2026-04-07\n|author=\n; Moral Rights: {{Wikidata|Q138978470}}\n; Copyright: [[User:SubhashishPanigrahi]]\n}}\n{{self|cc-by-sa-4.0}}\n[[Category:Juray language]]\n\n── Plain-text metadata ───────────────────\nProject/Film name: OpenSpeaks Archives\nCast: Dinabandhu Gamango\nLanguage: Juray (ISO 639: juy)\nRuntime: 2:25 min\nGenre: Documentary\nIMDb tt14546228\nProducer: Subhashish Panigrahi\nSubtitles: In English by Name1 (creator), Name2 (editor)`}
+                placeholder={`Paste wikitext OR plain-text metadata here. Examples:\n\n── Commons wikitext ──────────────────────\n=={{int:filedesc}}==\n{{Information\n|description=\n{{OpenSpeaks\n|description=In this video...\n|Language=Juray (ISO 639: juy)\n|Location=Village, District, State/Province, Country\n|Runtime=2:25 min\n|Framework_p1=yes\n|Framework_p2=yes\n|Framework_p3=yes\n}}\n|date=2026-04-07\n|author=\n; Moral Rights: {{Wikidata|Q138978470}}\n; Copyright: [[User:SubhashishPanigrahi]]\n}}\n{{self|cc-by-sa-4.0}}\n[[Category:Juray language]]\n\n── Plain-text metadata ───────────────────\nProject/Film name: OpenSpeaks Archives\nCast: First3 Last3\nLanguage: Juray (ISO 639: juy)\nRuntime: 2:25 min\nGenre: Documentary\nIMDb tt14546228\nProducer: First1 Last1\nSubtitles: In English by Name1 (creator), Name2 (editor)`}
               />
               <div style={{ display: "flex", gap: "0.75rem", marginTop: "1rem", flexWrap: "wrap", alignItems: "center" }}>
                 <button className="btn-primary" onClick={handleParseWikitext}>⚡ Parse into form</button>
