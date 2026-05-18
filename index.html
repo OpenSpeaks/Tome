@@ -21,7 +21,7 @@
       const { useState, useCallback, useMemo, useEffect } = React;
 
 const SCHEMA_VERSION = "1.2";
-const APP_VERSION = "0.1.1-beta";
+const APP_VERSION = "0.1.2-beta";
 
 // ============================================================
 // OpenSpeaks Tome is an open source tool published by OpenSpeaks and maintained by Subhashish Panigrahi. Published under the MIT License. Updated 7 May 2026.
@@ -40,18 +40,25 @@ const defaultOralHistory = {
 
 const defaultRecord = {
   _version: SCHEMA_VERSION, _exportedAt: "",
+  // Source provenance (spec §1.1)
+  sourceType: "", sourceIdentifier: "", fileUrl: "", format: "", mimeType: "",
   fileName: "", fileType: "video", duration: "", color: "Color", sound: "Stereo",
   isOpenSpeaks: true, title: "", originalTitle: "", year: "", description: "",
   extraDescriptions: [],
   projectName: "", cast: "", country: "India", language: "", languageISO: "",
-  dialect: "", recordingPlace: "", studio: "", producer: "", director: "",
-  writer: "", cinematographer: "", editor: "", recordist: "",
-  genre: "Interview", topic: "", releaseDate: "", doi: "", eidr: "", imdb: "",
+  dialect: "", recordingPlace: "", studio: "",
+  producer: "", director: "", writer: "", cinematographer: "", editor: "", recordist: "",
+  publisher: "", creator: "", wikidataQid: "",
+  contributors: [],
+  genre: "Interview", topic: "", keywords: [],
+  releaseDate: "", date: "", dateDigitised: "",
+  doi: "", eidr: "", imdb: "",
   subtitleLanguage: "", subtitlePageUrl: "", subtitleCreators: "",
   subtitleEditorsReviewers: "", copyrightHolder: "", authorUsername: "",
   framework_p1: true, framework_p2: false, framework_p3: false,
-  date: "", source: "{{own}}", license: "cc-by-sa-4.0", categories: "",
+  source: "{{own}}", license: "cc-by-sa-4.0", categories: "",
   interviewees: [], oralHistory: { ...defaultOralHistory }, extra: {},
+  rawMetadata: {},
 };
 
 // ============================================================
@@ -578,6 +585,9 @@ function parsePlainTextToRecord(text) {
 // Auto-detect input format and dispatch to the right parser
 function parseAnyInput(text) {
   const t = text.trim();
+  // OpenSpeaks JSON export
+  const jsonObj = tryParseAsJSON(t);
+  if (jsonObj) return { result: jsonObj, format: "OpenSpeaks JSON" };
   // Wikitext: has {{Information or {{OpenSpeaks template markers
   if (/\{\{\s*information/i.test(t) || /\{\{\s*openspeaks/i.test(t) || /\{\{self\|/i.test(t)) {
     return { result: parseWikitextIntoRecord(t), format: "Commons wikitext" };
@@ -1291,80 +1301,115 @@ async function fetchArchiveOrgMeta(url) {
   const m = url.match(/archive\.org\/(?:details|embed)\/([^/?#\s]+)/);
   if (!m) throw new Error("Could not read the Archive.org identifier from the URL. Example: archive.org/details/IDENTIFIER");
   const id = m[1];
-  const apiUrl = "https://archive.org/metadata/" + id;
-  const res = await fetch(apiUrl, { mode: "cors" });
+  const res = await fetch("https://archive.org/metadata/" + id, { mode: "cors" });
   if (!res.ok) throw new Error("Archive.org API returned error " + res.status);
   const json = await res.json();
   const meta = json.metadata || {};
-  return normWebMeta({
-    title: meta.title,
-    description: meta.description,
-    year: meta.year || (meta.date || "").slice(0, 4),
-    language: Array.isArray(meta.language) ? meta.language[0] : meta.language,
-    duration: meta.runtime,
-    color: meta.color,
-    sound: meta.sound,
-    genre: meta.mediatype,
-    topic: meta.subject,
-    director: meta.director,
-    creator: meta.creator,
-    producer: meta.producer,
-    releaseDate: meta.date,
-    collection: Array.isArray(meta.collection) ? meta.collection.filter(x => x !== "opensource").join(", ") : meta.collection,
-    copyrightHolder: meta.credits,
-    license: meta.licenseurl || meta.rights,
-    imdb: (meta.identifier_arc || meta.external_identifier || []).find ? 
-      (arr(meta.external_identifier || []).find(x => /imdb/i.test(x)) || "").replace(/.*\/title\/(tt\d+).*/i, "$1") : "",
-  });
+  const files = json.files || [];
+  // Pick primary A/V file (spec §2.2)
+  const avFmts = ['MPEG4','Ogg Video','WebM','h.264','VBR MP3','Ogg Vorbis','MP3','FLAC','WAV'];
+  const avFile = files.find(f => avFmts.some(fmt => (f.format || "").includes(fmt)));
+  const fmtToMime = { 'MPEG4':'video/mp4','Ogg Video':'video/ogg','WebM':'video/webm','h.264':'video/mp4',
+    'VBR MP3':'audio/mpeg','MP3':'audio/mpeg','Ogg Vorbis':'audio/ogg','FLAC':'audio/flac','WAV':'audio/wav' };
+  const avMime = avFile ? (fmtToMime[avFile.format] || "") : "";
+  // Map mediatype → fileType
+  const mtMap = { movies:"video", audio:"audio", image:"image", texts:"document" };
+  return {
+    ...normWebMeta({
+      title: meta.title,
+      description: Array.isArray(meta.description) ? meta.description.join("\n") : meta.description,
+      year: meta.year || (meta.date || "").slice(0, 4),
+      language: Array.isArray(meta.language) ? meta.language[0] : meta.language,
+      duration: meta.runtime || meta.length || (avFile && avFile.length),
+      color: meta.color, sound: meta.sound,
+      genre: meta.genre || meta.subject,
+      topic: meta.subject,
+      director: meta.director,
+      creator: meta.creator,
+      producer: meta.producer,
+      publisher: meta.publisher,
+      releaseDate: meta.date,
+      projectName: Array.isArray(meta.collection)
+        ? meta.collection.filter(x => x !== "opensource" && x !== "fav-" + id)[0] || ""
+        : meta.collection,
+      copyrightHolder: meta.credits,
+      license: meta.licenseurl || meta.rights,
+      imdb: (arr(meta.external_identifier || []).find(x => /imdb/i.test(x)) || "").replace(/.*\/(tt\d+).*/i, "$1"),
+    }),
+    sourceType: "internetArchive",
+    sourceIdentifier: id,
+    fileType: mtMap[meta.mediatype] || "video",
+    fileName: avFile ? avFile.name : "",
+    format: avFile ? avFile.format : "",
+    mimeType: avMime,
+    fileUrl: avFile ? "https://archive.org/download/" + id + "/" + avFile.name : "",
+    rawMetadata: { internetArchive: json },
+  };
 }
 
-// ── Wikidata: uses the entity JSON API ────────────────────────────────────────
+// ── Wikidata: entity API with label resolution (spec §5.2) ──────────────────
 async function fetchWikidataMeta(url) {
   const m = url.match(/wikidata\.org\/wiki\/(Q\d+)/i) || url.match(/^(Q\d+)$/i);
   if (!m) throw new Error("Could not read a Wikidata Q-number from the URL. Example: https://www.wikidata.org/wiki/Q12345");
   const qid = m[1];
-  const apiUrl = "https://www.wikidata.org/w/api.php?action=wbgetentities&ids=" + qid + "&format=json&origin=*";
-  const res = await fetch(apiUrl);
+  const res = await fetch("https://www.wikidata.org/w/api.php?action=wbgetentities&ids=" + qid + "&format=json&origin=*");
   if (!res.ok) throw new Error("Wikidata API returned error " + res.status);
   const json = await res.json();
   const entity = (json.entities || {})[qid];
   if (!entity) throw new Error("No Wikidata entity found for " + qid);
 
-  const label = (entity.labels?.en?.value) || (Object.values(entity.labels || {})[0]?.value) || "";
-  const desc = (entity.descriptions?.en?.value) || "";
-
-  // Extract common claims. P57=director, P136=genre, P364=orig lang, P577=pub date, P2047=duration
+  const label = entity.labels?.en?.value || Object.values(entity.labels || {})[0]?.value || "";
+  const desc = entity.descriptions?.en?.value || "";
   const claims = entity.claims || {};
-  function claimStr(prop) {
-    const cs = claims[prop];
-    if (!cs || !cs.length) return "";
+
+  const claimVal = (prop) => {
+    const cs = claims[prop]; if (!cs || !cs.length) return "";
     const v = cs[0]?.mainsnak?.datavalue?.value;
     if (!v) return "";
     if (typeof v === "string") return v;
     if (v.time) return v.time.replace(/^\+/, "").slice(0, 10);
     if (v.amount) return v.amount.replace(/^\+/, "");
-    if (v.id) return v.id; // Q-number for entity references
+    if (v.id) return v.id;
     return "";
-  }
-  function claimLabels(prop, lang) {
-    const cs = claims[prop];
-    if (!cs) return [];
-    return cs.slice(0, 5).map(x => {
-      const id = x?.mainsnak?.datavalue?.value?.id;
-      if (!id) return "";
-      // Return Qid as fallback — caller can resolve if needed
-      return id;
-    }).filter(Boolean);
-  }
+  };
+  const claimQids = (prop) => {
+    const cs = claims[prop]; if (!cs) return [];
+    return cs.slice(0, 5).map(x => x?.mainsnak?.datavalue?.value?.id).filter(Boolean);
+  };
 
-  return normWebMeta({
-    title: label,
-    description: desc,
-    releaseDate: claimStr("P577"),
-    duration: claimStr("P2047"),
-    // For entities, qids won't resolve to names here but are preserved
-  });
+  // Batch-resolve linked entities (P57=director, P50=author, P86=composer,
+  // P123=publisher, P407=language-of-work, P136=genre)
+  const linkedQids = new Set();
+  ['P57','P50','P86','P123','P407','P136','P364'].forEach(p => claimQids(p).forEach(q => linkedQids.add(q)));
+  let lmap = {};
+  if (linkedQids.size) {
+    try {
+      const lr = await fetch("https://www.wikidata.org/w/api.php?action=wbgetentities&ids=" +
+        [...linkedQids].slice(0,20).join('|') + "&props=labels&format=json&origin=*");
+      const lj = await lr.json();
+      for (const [id, ent] of Object.entries(lj.entities || {})) {
+        lmap[id] = ent.labels?.en?.value || Object.values(ent.labels || {})[0]?.value || id;
+      }
+    } catch {}
+  }
+  const resolve = (prop) => claimQids(prop).map(q => lmap[q] || q).filter(Boolean).join(", ");
+
+  return {
+    ...normWebMeta({
+      title: label, description: desc,
+      director: resolve('P57'), creator: resolve('P50'),
+      publisher: resolve('P123'), genre: resolve('P136'),
+      language: resolve('P407'),
+      releaseDate: claimVal('P577'),
+      duration: claimVal('P2047'),
+    }),
+    sourceType: "wikidata",
+    sourceIdentifier: qid,
+    wikidataQid: qid,
+    rawMetadata: { wikidata: { entity } },
+  };
 }
+
 
 // ── AI-powered extraction via Anthropic API + web_search ─────────────────────
 async function fetchWithClaude(url, siteName) {
@@ -1429,15 +1474,62 @@ Return a JSON object with these fields (include only fields you found; omit abse
 }
 
 // ── Main URL dispatcher ───────────────────────────────────────────────────────
+function tryParseAsJSON(text) {
+  try {
+    const obj = JSON.parse(text.trim());
+    if (obj && typeof obj === "object" && obj._version) return obj;
+    return null;
+  } catch { return null; }
+}
+
 function detectSite(url) {
   if (/commons\.wikimedia\.org/i.test(url)) return "commons";
   if (/archive\.org/i.test(url)) return "archive.org";
   if (/wikidata\.org/i.test(url)) return "wikidata";
+  if (/wiktionary\.org/i.test(url)) return "wiktionary";
   if (/pad\.ma/i.test(url)) return "pad.ma";
   if (/indiancine\.ma/i.test(url)) return "indiancine.ma";
   if (/elararchive\.org/i.test(url)) return "elar";
+  if (/paradisec\.org/i.test(url)) return "paradisec";
+  if (/ruralindiaonline\.org/i.test(url)) return "pari";
   return "other";
 }
+
+// ── Wiktionary: resolve to Commons audio files (spec §6) ─────────────────────
+async function fetchWiktionaryMeta(url, setParseMsg, setPasteInput) {
+  const m = url.match(/([a-z]{2,3})\.wiktionary\.org\/wiki\/([^#?]+)/i);
+  if (!m) throw new Error("Could not parse Wiktionary URL. Example: en.wiktionary.org/wiki/word");
+  const [, lang, entry] = m;
+  const apiUrl = "https://" + lang + ".wiktionary.org/w/api.php?action=parse&page=" + encodeURIComponent(entry) + "&prop=wikitext&format=json&origin=*";
+  const res = await fetch(apiUrl);
+  const json = await res.json();
+  if (json.error) throw new Error(json.error.info || "Wiktionary API error");
+  const wikitext = (json.parse && json.parse.wikitext && json.parse.wikitext["*"]) || "";
+  if (!wikitext) throw new Error("No wikitext found for this entry.");
+  // Find audio files referenced in the entry
+  const audioFiles = [...wikitext.matchAll(/\{\{audio\|(?:File:)?([^|}]+)/gi)].map(m2 => m2[1].trim());
+  const fileLinks = [...wikitext.matchAll(/\[\[File:([^\]|]+\.(?:ogg|mp3|wav|flac))/gi)].map(m2 => m2[1].trim());
+  const allFiles = [...new Set([...audioFiles, ...fileLinks])];
+  if (!allFiles.length) throw new Error("No audio files found on this Wiktionary page.");
+  const fileName = allFiles[0];
+  setParseMsg({ type: "info", text: "Found audio \"" + fileName + "\" — fetching from Commons…" });
+  // Redirect to Commons importer
+  const commonsTitle = "File:" + fileName;
+  const cRes = await fetch("https://commons.wikimedia.org/w/api.php?action=parse&page=" + encodeURIComponent(commonsTitle) + "&prop=wikitext&format=json&origin=*");
+  const cJson = await cRes.json();
+  if (cJson.error) throw new Error(cJson.error.info);
+  const cWikitext = (cJson.parse && cJson.parse.wikitext && cJson.parse.wikitext["*"]) || "";
+  if (!cWikitext) throw new Error("Could not fetch Commons metadata for " + commonsTitle);
+  setPasteInput(cWikitext);
+  const parsed = parseWikitextIntoRecord(cWikitext);
+  return {
+    ...parsed,
+    sourceType: "wiktionary",
+    sourceIdentifier: lang + ":" + entry,
+    rawMetadata: { wiktionary: { entry, lang, audioFiles: allFiles } },
+  };
+}
+
 
 function App() {
   const [record, setRecord] = useState(defaultRecord);
@@ -1498,6 +1590,10 @@ function App() {
       } else if (site === "wikidata") {
         const meta = await fetchWikidataMeta(url);
         applyParsed(meta, "Wikidata entity");
+
+      } else if (site === "wiktionary") {
+        const meta = await fetchWiktionaryMeta(url, setParseMsg, setPasteInput);
+        applyParsed(meta, "Wiktionary entry → Commons audio");
 
       } else {
         // pad.ma, indiancine.ma, ELAR, or unknown — AI-assisted
@@ -1919,28 +2015,8 @@ function App() {
                 Paste a URL and click <strong>Fetch metadata</strong>. The tool reads the page and fills the form automatically.
               </p>
 
-              {/* Site chips */}
-              <div style={{ display: "flex", gap: "0.45rem", flexWrap: "wrap", marginBottom: "0.9rem" }}>
-                {[
-                  { name: "Wikimedia Commons", color: "#3B84D0", example: "https://commons.wikimedia.org/wiki/File:OpenSpeaks-juy-Juray-Dinabandhu_Gamango-OG-Social_Impact_of_Aadhaar.webm", note: "Direct API" },
-                  { name: "Internet Archive", color: "#4A6FA5", example: "https://archive.org/details/IDENTIFIER", note: "Direct API" },
-                  { name: "Wikidata", color: "#990000", example: "https://www.wikidata.org/wiki/Q12345", note: "Direct API" },
-                  { name: "Pad.ma", color: "#5C6BC0", example: "https://pad.ma/IDENTIFIER", note: "AI-assisted" },
-                  { name: "Indiancine.ma", color: "#2E7D32", example: "https://indiancine.ma/CWEZ/info", note: "AI-assisted" },
-                  { name: "ELAR", color: "#6A4C93", example: "https://www.elararchive.org/dk0848", note: "AI-assisted" },
-                ].map(site => (
-                  <button key={site.name} onClick={() => setCommonsUrl(site.example)}
-                    title={"Click to fill example URL — " + site.note}
-                    style={{ display: "inline-flex", alignItems: "center", gap: "0.3rem", padding: "0.28rem 0.65rem", borderRadius: "999px", border: "1.5px solid " + site.color, background: "transparent", color: site.color, fontSize: "0.72rem", fontWeight: 600, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
-                    {site.name}
-                    <span style={{ fontSize: "0.62rem", opacity: 0.75, fontWeight: 400 }}>({site.note})</span>
-                  </button>
-                ))}
-              </div>
-
-              <p style={{ fontSize: "0.72rem", color: "var(--muted)", margin: "0 0 0.75rem 0", lineHeight: 1.5 }}>
-                <strong>Direct API</strong> — fetches data directly from the site's public API (fast, reliable).{" "}
-                <strong>AI-assisted</strong> — uses AI to read the page and extract metadata (a few seconds; requires internet access).
+              <p style={{ fontSize: "0.75rem", color: "var(--muted)", margin: "0 0 0.85rem 0", lineHeight: 1.6 }}>
+                Works best with <strong>Wikimedia Commons</strong> file pages. Also parses Internet Archive, Wikidata, Wiktionary, and other archives — results may need editing after import.
               </p>
 
               <div style={{ display: "flex", gap: "0.65rem", alignItems: "center", flexWrap: "wrap" }}>
@@ -1948,7 +2024,7 @@ function App() {
                   type="url"
                   value={commonsUrl}
                   onChange={e => setCommonsUrl(e.target.value)}
-                  placeholder="Paste a URL or click a site button above…"
+                  placeholder="https://commons.wikimedia.org/wiki/File:… or other archive URL"
                   style={{ flex: "1 1 320px", padding: "0.5rem 0.65rem", borderRadius: "6px", border: "1.5px solid var(--border)", background: "var(--surface)", color: "var(--text)", fontSize: "0.82rem", fontFamily: "inherit" }}
                   onKeyDown={e => { if (e.key === "Enter") fetchFromUrl(); }}
                 />
@@ -1967,18 +2043,19 @@ function App() {
               <ul style={{ fontSize: "0.76rem", color: "var(--muted)", margin: "0 0 1rem 1.25rem", padding: 0, lineHeight: 1.9 }}>
                 <li><strong>Wikimedia Commons wikitext</strong> — a full file page with <code>{"{{Information}}"}</code> and/or <code>{"{{OpenSpeaks}}"}</code></li>
                 <li><strong>Plain-text or spreadsheet notes</strong> — lines like <code>Language: Juray (ISO 639: juy)</code> or <code>Cast: Name</code> work fine</li>
-                <li><strong>.txt or .docx file</strong> — use the upload button below; the text is read and parsed for you</li>
+                <li><strong>OpenSpeaks JSON</strong> — paste or upload a previous export to continue editing it</li>
+                <li><strong>.txt, .docx, .json, .xml, .html, .md</strong> — upload using the button below; text is extracted automatically</li>
               </ul>
               <label className="import-zone" style={{ display: "flex", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: "0.65rem", padding: "0.85rem 1rem", marginBottom: "1rem" }}>
                 <span style={{ fontSize: "1.4rem" }}>📂</span>
                 <div>
-                  <div style={{ fontWeight: 600, fontSize: "0.8rem", color: "var(--text2)" }}>Upload a file (.txt or .docx)</div>
-                  <div style={{ fontSize: "0.68rem", color: "var(--muted)" }}>Plain text, wikitext, or Word document</div>
+                  <div style={{ fontWeight: 600, fontSize: "0.8rem", color: "var(--text2)" }}>Upload a file</div>
+                  <div style={{ fontSize: "0.68rem", color: "var(--muted)" }}>Accepts .txt, .docx, .json, .xml, .html, .md — wikitext, plain-text, or export files</div>
                 </div>
-                <input type="file" accept=".txt,.docx" style={{ display: "none" }} onChange={e => {
+                <input type="file" accept=".txt,.docx,.json,.xml,.html,.htm,.md" style={{ display: "none" }} onChange={e => {
                   const file = e.target.files[0]; if (!file) return;
-                  const isDOCX = file.name.toLowerCase().endsWith(".docx");
-                  if (isDOCX) {
+                  const ext = file.name.split('.').pop().toLowerCase();
+                  if (ext === "docx") {
                     if (typeof mammoth === "undefined") {
                       setParseMsg({ type: "error", text: "Mammoth library not loaded yet. Try refreshing the page." }); return;
                     }
@@ -1988,9 +2065,9 @@ function App() {
                         .then(res2 => {
                           const text = res2.value; setPasteInput(text);
                           const { result: parsed, format } = parseAnyInput(text);
-                          applyParsed(parsed, `Word document "${file.name}"`);
+                          applyParsed(parsed, "Word document \"" + file.name + "\" (" + format + ")");
                         })
-                        .catch(() => setParseMsg({ type: "error", text: `Could not extract text from "${file.name}". Ensure it is a valid .docx file.` }));
+                        .catch(() => setParseMsg({ type: "error", text: "Could not extract text from \"" + file.name + "\". Ensure it is a valid .docx file." }));
                     };
                     reader.readAsArrayBuffer(file);
                   } else {
@@ -1998,7 +2075,7 @@ function App() {
                     reader.onload = ev => {
                       const text = ev.target.result; setPasteInput(text);
                       const { result: parsed, format } = parseAnyInput(text);
-                      applyParsed(parsed, `file "${file.name}"`);
+                      applyParsed(parsed, "file \"" + file.name + "\" (" + format + ")");
                     };
                     reader.readAsText(file);
                   }
